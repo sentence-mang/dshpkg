@@ -287,3 +287,22 @@ truth even when the recipe repo is offline.
 `resolveEntries` treats string deps as plain specs (installed as the name
 itself, no recipe lookup). Only object deps recurse. This is the intended
 semantic: a recipe may depend on packages that have no recipe.
+
+### R10. status/doctor read the official loader first; two upstream follow-ups
+
+`GET /dshpkg/status` now merges live `loader.entries()` (id / module /
+disabled / phase) with `state.packages` into `officialEntries`. Entries the
+official tree owns get `source: "official-loader"` (with the official
+phase/disabled); `crashCount`/`circuitOpen` still come from the state
+bookkeeping, and state-only entries get `source: "dshpkg-state"`. Without a
+loader (or when `entries()` throws) `officialEntries` is null and the plain
+state/managed path stays intact. Upstream follow-ups:
+
+- The official fail-loud boot error has NO structured exit channel (errors
+  are stderr text only); dshpkg's triage text parsing is a patch over that
+  official gap. If upstream adds a pre-mount hook / loader error events,
+  triage and the install precheck should move to the official channel.
+- The official plugin-inventory service is read-only (cannot
+  enable/disable/add/remove), so enable/disable persistence has exactly one
+  official path: the patch layer (cordis.patch.yml). If upstream extends the
+  inventory with mutation APIs, dshpkg should migrate to them.
