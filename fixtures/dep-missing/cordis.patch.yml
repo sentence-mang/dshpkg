@@ -1,0 +1,3 @@
+- insert:
+    - id: dep-missing-fixture
+      name: dshpkg-fixture-dep-missing

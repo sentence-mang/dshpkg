@@ -1,0 +1,3 @@
+- insert:
+    - id: boot-crash-fixture
+      name: dshpkg-fixture-boot-crash
