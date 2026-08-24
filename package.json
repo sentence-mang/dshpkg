@@ -1,0 +1,49 @@
+{
+  "name": "dshpkg",
+  "version": "0.1.0",
+  "description": "apt-style plugin manager for DeepSeek Harness: AUR-like recipe repos, transactional install with rollback, crash circuit breaker, watchdog self-healing. Depends only on the official kernel.",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "bin": {
+    "dshpkg": "bin/dshpkg.js"
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check bin/dshpkg.js && node --check bin/supervisor.js",
+    "test": "node --test tests/"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin-manager",
+    "package-manager"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}

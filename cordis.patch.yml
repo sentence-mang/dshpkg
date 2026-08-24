@@ -1,0 +1,4 @@
+# dshpkg — apt-style plugin manager host service (L1 stable layer).
+- insert:
+    - id: dshpkg
+      name: dshpkg
