@@ -19,7 +19,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, readFile, writeFile } from "node:fs/promises";
+import { copyFile, readFile, realpath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -128,15 +128,36 @@ function unquoteYamlScalar(value) {
   return v;
 }
 
+/**
+ * Extract the first insert entry (id + name) from a package's own
+ * cordis.patch.yml (the official bundle patch shape is
+ * `- insert: [{ id, name }]`). The name is the `name:` line belonging to
+ * the matched `- id:` entry. Returns null when no `- id:` line exists.
+ */
+function extractInsertEntry(patchText) {
+  if (!patchText) return null;
+  const lines = String(patchText).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^[ \t]*-[ \t]+id:[ \t]*(.+?)[ \t]*(?:#.*)?$/.exec(lines[i]);
+    if (!match) continue;
+    let name = null;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (/^[ \t]*-[ \t]+id:/.test(lines[j])) break; // next entry reached
+      const nameMatch = /^[ \t]*name:[ \t]*(.+?)[ \t]*(?:#.*)?$/.exec(lines[j]);
+      if (nameMatch) {
+        name = unquoteYamlScalar(nameMatch[1]);
+        break;
+      }
+    }
+    return { id: unquoteYamlScalar(match[1]), name };
+  }
+  return null;
+}
+
 // First `- id: <value>` line inside a package's own cordis.patch.yml (the
 // official bundle patch shape is `- insert: [{ id, name }]`).
 function extractInsertEntryId(patchText) {
-  if (!patchText) return null;
-  for (const line of String(patchText).split(/\r?\n/)) {
-    const match = /^[ \t]*-[ \t]+id:[ \t]*(.+?)[ \t]*(?:#.*)?$/.exec(line);
-    if (match) return unquoteYamlScalar(match[1]);
-  }
-  return null;
+  return extractInsertEntry(patchText)?.id ?? null;
 }
 
 /** Read a text file; a missing file reads as "". */
@@ -198,6 +219,187 @@ export async function resolveEntryByPackage(profileDir, pkgName) {
     if (entryId) return entryId;
   }
   return null;
+}
+
+// --- triage: installed bundles + real-path attribution ----------------------
+
+// Normalise arbitrary text for path comparison: strip file:// URL prefixes,
+// unify separators to forward slashes and fold case — junction targets,
+// stack traces and dependency values may disagree in any of these.
+function normalizePathForCompare(value) {
+  return String(value ?? "")
+    .replace(/file:\/+/gi, "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+}
+
+// Does a (raw) directory path appear in already-normalised text as a full
+// path component? The character right after the match must not continue the
+// directory name (sync-crash must not match sync-crash-v2).
+function pathAppearsInText(pathValue, normalizedText) {
+  const needle = normalizePathForCompare(pathValue);
+  if (!needle) return false;
+  const idx = normalizedText.indexOf(needle);
+  if (idx === -1) return false;
+  const next = normalizedText[idx + needle.length];
+  return (
+    next === undefined ||
+    next === "/" ||
+    next === ")" ||
+    next === ":" ||
+    next === "\n"
+  );
+}
+
+// Does an entry/module name appear in normalised text as a standalone token?
+// Letters/digits/`-`/`_` join words (pkg must not match pkg-v2); path
+// separators, parentheses and other punctuation delimit.
+function moduleNameAppearsInText(name, normalizedText) {
+  const needle = String(name ?? "").toLowerCase();
+  if (!needle) return false;
+  const wordChar = (ch) => ch !== undefined && /[a-z0-9_-]/.test(ch);
+  let from = 0;
+  for (;;) {
+    const idx = normalizedText.indexOf(needle, from);
+    if (idx === -1) return false;
+    const before = normalizedText[idx - 1];
+    const after = normalizedText[idx + needle.length];
+    if (!wordChar(before) && !wordChar(after)) return true;
+    from = idx + 1;
+  }
+}
+
+/**
+ * Collect the real on-disk locations of one installed package:
+ *   a) <profileDir>/node_modules/<pkgName> when present — fs.realpath
+ *      resolves pnpm link: junctions / symlinks to the true source dir;
+ *   b) a link:/file: dependency value carries the source path verbatim
+ *      (e.g. "link:C:/…/fixtures/sync-crash"): extract + realpath it too.
+ * Raw realpath strings are kept (fs-readable); comparison normalises.
+ */
+async function resolvePackageRealPaths(profileDir, pkgName, depValue) {
+  const paths = new Set();
+  const candidates = [];
+  const nodeModulesDir = join(profileDir, "node_modules", pkgName);
+  if (existsSync(nodeModulesDir)) candidates.push(nodeModulesDir);
+  const bare = String(depValue ?? "")
+    .trim()
+    .replace(/^(link:|file:)/, "");
+  if (bare && /^[a-zA-Z]:[\\/]|^[./]|^\//.test(bare)) candidates.push(bare);
+  for (const candidate of candidates) {
+    try {
+      paths.add(await realpath(candidate));
+    } catch {
+      // broken junction / missing directory: skip
+    }
+  }
+  return [...paths];
+}
+
+/**
+ * Inventory the installed bundles of a profile for stack attribution:
+ * package names from package.json dependencies + dsh.profile.bundles (merged,
+ * deduped), each with its real disk paths and its insert entry ids + names
+ * (read from the bundle's own cordis.patch.yml next to the real path).
+ * Any failure (missing/broken profile) degrades to []: attribution must
+ * never block the watchdog.
+ *
+ * @param {string} profileDir absolute profile directory
+ * @returns {Promise<Array<{pkgName:string, realPaths:string[], entryIds:string[], moduleNames:string[]}>>}
+ */
+export async function listInstalledBundles(profileDir) {
+  const out = [];
+  try {
+    const manifest = await readJson(join(profileDir, "package.json"), null);
+    if (!manifest || typeof manifest !== "object") return out;
+    const deps =
+      manifest.dependencies && typeof manifest.dependencies === "object"
+        ? manifest.dependencies
+        : {};
+    const bundles = Array.isArray(manifest?.dsh?.profile?.bundles)
+      ? manifest.dsh.profile.bundles
+      : [];
+    const names = [];
+    const pushName = (name) => {
+      if (name && !names.includes(name)) names.push(name);
+    };
+    for (const key of Object.keys(deps)) pushName(key);
+    for (const raw of bundles) {
+      // Bundle entries may carry a link:/file: prefix or a version suffix
+      // (pkg@1.0.0); the identifier is always the bare package name.
+      pushName(
+        String(raw ?? "")
+          .trim()
+          .replace(/^(link:|file:)/, "")
+          .replace(/@[^@/]+$/, ""),
+      );
+    }
+    for (const pkgName of names) {
+      const realPaths = await resolvePackageRealPaths(
+        profileDir,
+        pkgName,
+        deps[pkgName],
+      );
+      const entryIds = [];
+      const moduleNames = [];
+      for (const realPath of realPaths) {
+        const entry = extractInsertEntry(
+          await readTextOrEmpty(join(realPath, "cordis.patch.yml")),
+        );
+        if (!entry) continue;
+        if (entry.id && !entryIds.includes(entry.id)) entryIds.push(entry.id);
+        if (entry.name && !moduleNames.includes(entry.name)) {
+          moduleNames.push(entry.name);
+        }
+      }
+      out.push({ pkgName, realPaths, entryIds, moduleNames });
+    }
+  } catch {
+    // broken profile on disk: no attribution possible this round
+  }
+  return out;
+}
+
+/**
+ * Attribute an uncaughtException stack (or any stderr text) to an installed
+ * bundle by matching the bundle's real disk paths inside the text:
+ *   - the text is normalised (file:// stripped, separators unified, case
+ *     folded), so a link: junction stack naming the TRUE source path
+ *     (no node_modules segment) still hits;
+ *   - a hit takes the bundle's first insert entry id; when no real path
+ *     matches, a verbatim entry-name mention is the weaker fallback signal.
+ * Returns { entryId, pkgName } — both null when nothing matches.
+ *
+ * @param {string} stderrText stderr tail or any text; null-safe
+ * @param {Array<object>} installed listInstalledBundles() output
+ * @returns {{entryId:string|null, pkgName:string|null}}
+ */
+export function attributeFromStack(stderrText, installed) {
+  const text = normalizePathForCompare(stderrText);
+  const list = Array.isArray(installed) ? installed : [];
+  for (const bundle of list) {
+    const realPaths = Array.isArray(bundle?.realPaths) ? bundle.realPaths : [];
+    if (realPaths.some((p) => pathAppearsInText(p, text))) {
+      return {
+        entryId: bundle.entryIds?.[0] ?? null,
+        pkgName: bundle.pkgName ?? null,
+      };
+    }
+  }
+  // No real path found in the text: an entry-name mention is a weaker but
+  // still package-specific signal (e.g. "dshpkg-fixture-sync-crash").
+  for (const bundle of list) {
+    const names = Array.isArray(bundle?.moduleNames) ? bundle.moduleNames : [];
+    for (const name of names) {
+      if (moduleNameAppearsInText(String(name), text)) {
+        return {
+          entryId: bundle.entryIds?.[0] ?? null,
+          pkgName: bundle.pkgName ?? null,
+        };
+      }
+    }
+  }
+  return { entryId: null, pkgName: null };
 }
 
 // --- cordis.patch.yml helpers (exported for tests) --------------------------
@@ -636,27 +838,59 @@ export async function supervise(
       }
 
       // Attribution order (E2E finding: sync-crash uncaughtException):
-      // 1) loader errors, 2) uncaughtException stack package -> entry id,
-      // 3) null (failure counter then climbs to the snapshot path).
+      // 1) loader errors, 2) installed-bundle stack attribution — fs.realpath
+      // resolves link: junctions so a stack naming the TRUE source path
+      // (no node_modules segment) still finds its package, 3) legacy
+      // node_modules/<pkg>/ segment scan (packages present on disk without a
+      // manifest declaration), 4) null (failure counter then climbs to the
+      // snapshot path).
       const output = stdoutText + stderrText;
+      const firstLine =
+        String(stderrText)
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .find((line) => line.length > 0) ?? "";
       const triaged = parseLoaderErrors(output);
       let culprit = triaged.length > 0 ? triaged[triaged.length - 1] : null;
       if (!culprit) {
-        for (const candidate of parseUncaughtModule(output)) {
-          const entryId = await resolveEntryByPackage(profileDir, candidate);
-          if (entryId) {
-            const firstLine =
-              String(stderrText)
-                .split(/\r?\n/)
-                .map((line) => line.trim())
-                .find((line) => line.length > 0) ?? "";
-            culprit = {
-              stage: "uncaughtException",
-              entryId,
-              entryName: candidate,
-              detail: firstLine,
-            };
-            break;
+        // The installed-bundle inventory is refreshed on every attribution
+        // (the profile may change between restarts); a failure degrades to
+        // [] and must never block the watchdog.
+        let installed = [];
+        try {
+          installed = await listInstalledBundles(profileDir);
+        } catch {
+          // no attribution possible this round
+        }
+        const attributed = attributeFromStack(output, installed);
+        let entryId = attributed.entryId;
+        const entryName = attributed.pkgName ?? null;
+        if (!entryId && entryName) {
+          // Real-path hit but no insert entry id on file: fall back to the
+          // existing package -> entry resolver.
+          entryId = await resolveEntryByPackage(profileDir, entryName);
+        }
+        if (entryId) {
+          culprit = {
+            stage: "uncaughtException",
+            entryId,
+            entryName,
+            detail: firstLine,
+          };
+        } else {
+          // Legacy fallback: packages installed without a dependencies /
+          // bundles declaration still leave node_modules/<pkg>/ segments.
+          for (const candidate of parseUncaughtModule(output)) {
+            const id = await resolveEntryByPackage(profileDir, candidate);
+            if (id) {
+              culprit = {
+                stage: "uncaughtException",
+                entryId: id,
+                entryName: candidate,
+                detail: firstLine,
+              };
+              break;
+            }
           }
         }
       }

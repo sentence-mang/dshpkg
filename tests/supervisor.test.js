@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,8 @@ import {
   parseLoaderErrors,
   parseUncaughtModule,
   resolveEntryByPackage,
+  listInstalledBundles,
+  attributeFromStack,
   readPatchTopLevel,
   writeManagedDisable,
   removeManagedBlock,
@@ -251,6 +253,218 @@ test("resolveEntryByPackage: returns null when nothing resolves", async () => {
     "utf8",
   );
   assert.equal(await resolveEntryByPackage(dir, "no-such-package"), null);
+});
+
+// --- listInstalledBundles / attributeFromStack ------------------------------
+
+// The real E2E stderr of a link:-installed sync-crash fixture: the pnpm
+// junction makes Node report the TRUE source path — no node_modules segment,
+// no package name — so only real-path matching can attribute it.
+const LINK_CRASH_STACK = [
+  "Error: sync-crash fixture: intentional uncaughtException",
+  "    at Timeout._onTimeout (file:///C:/Users/Sente/.dsh/dshpkg/dsh-pkg/fixtures/sync-crash/index.js:8:11)",
+].join("\n");
+
+/** cordis.patch.yml text of the real sync-crash fixture. */
+const SYNC_CRASH_PATCH =
+  "- insert:\n    - id: sync-crash-fixture\n      name: dshpkg-fixture-sync-crash\n";
+
+test("listInstalledBundles: node_modules form resolves real path, entry id and name", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  const pkgDir = join(dir, "node_modules", "pkg-plain");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "cordis.patch.yml"),
+    "- insert:\n    - id: plain-entry\n      name: pkg-plain\n",
+    "utf8",
+  );
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "fake-profile",
+      dependencies: { "pkg-plain": "^1.0.0" },
+      dsh: { profile: { bundles: ["pkg-plain"] } },
+    }),
+    "utf8",
+  );
+  const installed = await listInstalledBundles(dir);
+  assert.equal(installed.length, 1);
+  assert.equal(installed[0].pkgName, "pkg-plain");
+  assert.deepEqual(installed[0].realPaths, [await realpath(pkgDir)]);
+  assert.deepEqual(installed[0].entryIds, ["plain-entry"]);
+  assert.deepEqual(installed[0].moduleNames, ["pkg-plain"]);
+});
+
+test("listInstalledBundles: bundles-only names and version suffixes merge into one", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  const pkgDir = join(dir, "node_modules", "bundle-only");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "cordis.patch.yml"),
+    "- insert:\n    - id: bundle-entry\n      name: bundle-only\n",
+    "utf8",
+  );
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "fake-profile",
+      dsh: { profile: { bundles: ["bundle-only@2.0.0", "bundle-only"] } },
+    }),
+    "utf8",
+  );
+  const installed = await listInstalledBundles(dir);
+  assert.equal(installed.length, 1);
+  assert.equal(installed[0].pkgName, "bundle-only");
+  assert.deepEqual(installed[0].entryIds, ["bundle-entry"]);
+});
+
+test("listInstalledBundles: link: dependency value contributes its source path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  const srcDir = join(dir, "fixtures", "sync-crash");
+  await mkdir(srcDir, { recursive: true });
+  await writeFile(join(srcDir, "cordis.patch.yml"), SYNC_CRASH_PATCH, "utf8");
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "fake-profile",
+      dependencies: { "dshpkg-fixture-sync-crash": `link:${srcDir}` },
+    }),
+    "utf8",
+  );
+  const installed = await listInstalledBundles(dir);
+  assert.equal(installed.length, 1);
+  assert.equal(installed[0].pkgName, "dshpkg-fixture-sync-crash");
+  assert.deepEqual(installed[0].realPaths, [await realpath(srcDir)]);
+  assert.deepEqual(installed[0].entryIds, ["sync-crash-fixture"]);
+  assert.deepEqual(installed[0].moduleNames, ["dshpkg-fixture-sync-crash"]);
+});
+
+test("listInstalledBundles: node_modules junction resolves to the link source (deduped)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  const srcDir = await mkdtemp(join(tmpdir(), "dshpkg-sup-src-"));
+  await writeFile(join(srcDir, "cordis.patch.yml"), SYNC_CRASH_PATCH, "utf8");
+  const nmDir = join(dir, "node_modules");
+  await mkdir(nmDir, { recursive: true });
+  try {
+    await symlink(
+      srcDir,
+      join(nmDir, "dshpkg-fixture-sync-crash"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch {
+    // junction/symlink creation unsupported in this runner: the link:
+    // dependency value below still carries the source path, which exercises
+    // the same attribution (the junction form is the Windows E2E reality).
+  }
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "fake-profile",
+      dependencies: { "dshpkg-fixture-sync-crash": `link:${srcDir}` },
+    }),
+    "utf8",
+  );
+  const installed = await listInstalledBundles(dir);
+  assert.equal(installed.length, 1);
+  // Both collection forms (junction + dependency value) collapse into one
+  // real path — the true source directory.
+  assert.deepEqual(installed[0].realPaths, [await realpath(srcDir)]);
+  assert.deepEqual(installed[0].entryIds, ["sync-crash-fixture"]);
+});
+
+test("listInstalledBundles: no dependencies/bundles returns []", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "fake-profile", dsh: { profile: { bundles: [] } } }),
+    "utf8",
+  );
+  assert.deepEqual(await listInstalledBundles(dir), []);
+  // also when package.json is missing entirely
+  const empty = await mkdtemp(join(tmpdir(), "dshpkg-sup-installed-"));
+  assert.deepEqual(await listInstalledBundles(empty), []);
+});
+
+test("attributeFromStack: attributes the real E2E link: stack via the source real path", () => {
+  const installed = [
+    {
+      pkgName: "dshpkg-fixture-sync-crash",
+      // Windows realpath returns backslashes: the comparison must normalise.
+      realPaths: ["C:\\Users\\Sente\\.dsh\\dshpkg\\dsh-pkg\\fixtures\\sync-crash"],
+      entryIds: ["sync-crash-fixture"],
+      moduleNames: ["dshpkg-fixture-sync-crash"],
+    },
+  ];
+  assert.deepEqual(attributeFromStack(LINK_CRASH_STACK, installed), {
+    entryId: "sync-crash-fixture",
+    pkgName: "dshpkg-fixture-sync-crash",
+  });
+});
+
+test("attributeFromStack: node_modules real-path form still matches", () => {
+  const installed = [
+    {
+      pkgName: "pkg-plain",
+      realPaths: ["C:/profiles/web/node_modules/pkg-plain"],
+      entryIds: ["plain-entry"],
+      moduleNames: ["pkg-plain"],
+    },
+  ];
+  const stack = [
+    "Error: boom",
+    "    at fn (C:\\profiles\\web\\node_modules\\pkg-plain\\index.js:3:3)",
+  ].join("\n");
+  assert.deepEqual(attributeFromStack(stack, installed), {
+    entryId: "plain-entry",
+    pkgName: "pkg-plain",
+  });
+});
+
+test("attributeFromStack: a path fragment is not confused with a longer sibling name", () => {
+  const installed = [
+    {
+      pkgName: "pkg",
+      realPaths: ["C:/x/pkg"],
+      entryIds: ["pkg-entry"],
+      moduleNames: ["pkg"],
+    },
+  ];
+  const stack = [
+    "Error: boom",
+    "    at fn (C:\\x\\pkg-v2\\index.js:3:3)",
+  ].join("\n");
+  assert.deepEqual(attributeFromStack(stack, installed), {
+    entryId: null,
+    pkgName: null,
+  });
+});
+
+test("attributeFromStack: an entry-name mention is the fallback signal", () => {
+  const installed = [
+    {
+      pkgName: "dshpkg-fixture-sync-crash",
+      realPaths: ["C:/elsewhere/not-in-stack"],
+      entryIds: ["sync-crash-fixture"],
+      moduleNames: ["dshpkg-fixture-sync-crash"],
+    },
+  ];
+  const stack = "Error: dshpkg-fixture-sync-crash exploded";
+  assert.deepEqual(attributeFromStack(stack, installed), {
+    entryId: "sync-crash-fixture",
+    pkgName: "dshpkg-fixture-sync-crash",
+  });
+});
+
+test("attributeFromStack: no match returns null entryId and null pkgName", () => {
+  assert.deepEqual(attributeFromStack("unrelated noise\n", []), {
+    entryId: null,
+    pkgName: null,
+  });
+  assert.deepEqual(attributeFromStack("", []), { entryId: null, pkgName: null });
+  assert.deepEqual(attributeFromStack(null, undefined), {
+    entryId: null,
+    pkgName: null,
+  });
 });
 
 // --- readPatchTopLevel -----------------------------------------------------
@@ -562,6 +776,94 @@ test("supervise: sync-crash uncaughtException is attributed and disabled", async
   const bootFailed = events.find((e) => e.type === "boot-failed");
   assert.equal(bootFailed.detail.entryId, "sync-crash-fixture");
   assert.ok(bootFailed.detail.detail.includes("sync-crash fixture"));
+  assert.equal(children.length, 2);
+});
+
+// --- supervise: link: junction uncaughtException (E2E finding) ---------------
+
+test("supervise: link: junction uncaughtException is attributed via its real path", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  // pnpm link: install layout: the sources live outside the profile and
+  // node_modules/<pkg> is a junction; the Node stack then shows the TRUE
+  // source path (no node_modules segment, no package name), which is exactly
+  // what the E2E sync-crash run produced.
+  const srcDir = await mkdtemp(join(tmpdir(), "dshpkg-sup-src-"));
+  await writeFile(join(srcDir, "cordis.patch.yml"), SYNC_CRASH_PATCH, "utf8");
+  const nmDir = join(profileDir, "node_modules");
+  await mkdir(nmDir, { recursive: true });
+  try {
+    await symlink(
+      srcDir,
+      join(nmDir, "dshpkg-fixture-sync-crash"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch {
+    // junction creation unsupported: the link: dependency value below still
+    // carries the source path, covering the same attribution.
+  }
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({
+      name: "web",
+      dsh: { profile: { bundles: ["dshpkg-fixture-sync-crash"] } },
+      dependencies: { "dshpkg-fixture-sync-crash": `link:${srcDir}` },
+    }),
+    "utf8",
+  );
+  const realSrc = (await realpath(srcDir)).replace(/\\/g, "/");
+  const linkCrashStack = [
+    "Error: sync-crash fixture: intentional uncaughtException",
+    `    at Timeout._onTimeout (file:///${realSrc}/index.js:8:11)`,
+  ].join("\n");
+
+  const events = [];
+  const children = [];
+  let graceCalls = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    // First child dies during its grace sleep with the junction-resolved
+    // stack; every later child stays alive.
+    sleepImpl: async () => {
+      const index = graceCalls;
+      graceCalls += 1;
+      const child = children[index];
+      if (child && index === 0) {
+        child.stderr.emit("data", linkCrashStack);
+        child.emit("exit", 1, null);
+      }
+    },
+  });
+  // Wait for the restart to settle (second spawn healthy), then stop.
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
+  assert.match(patch, /# dshpkg:managed:start/);
+  assert.match(patch, /- id: sync-crash-fixture/);
+  assert.match(patch, /disabled: true/);
+  assert.match(patch, /# dshpkg:managed:end/);
+  // original user content untouched
+  assert.match(patch, /- id: original-entry/);
+
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("boot-failed"));
+  assert.ok(types.includes("restarting"));
+  assert.ok(types.includes("healthy"));
+  assert.equal(types.includes("circuit-open"), false);
+
+  const bootFailed = events.find((e) => e.type === "boot-failed");
+  assert.equal(bootFailed.detail.entryId, "sync-crash-fixture");
   assert.equal(children.length, 2);
 });
 
