@@ -26,6 +26,7 @@ import { pathToFileURL } from "node:url";
 
 import { listSnapshots, resolveProfileDir, statePath } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
+import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
 
 // --- tuning constants (exported for tests / documentation) -----------------
 
@@ -130,6 +131,8 @@ function managedBlockContainsId(blockText, entryId) {
  * Append a managed disable block for entryId to <profileDir>/cordis.patch.yml.
  * Only appends (never rewrites existing lines); skips when a managed block for
  * the same id already exists; refuses non-array / non-empty top levels.
+ * A bare `[]` placeholder (official profile initial state) is replaced, not
+ * appended after: `[]` cannot take sibling lines in YAML.
  *
  * @returns {Promise<{written:boolean}>}
  */
@@ -151,7 +154,15 @@ export async function writeManagedDisable(profileDir, entryId) {
     if (managedBlockContainsId(match[1], entryId)) return { written: false };
   }
   const block = `${MANAGED_START}\n- id: ${yamlSafeId(entryId)}\n  disabled: true\n${MANAGED_END}\n`;
-  const base = text.length === 0 || text.endsWith("\n") ? text : text + "\n";
+  let base = text;
+  if (isEntrylessPatch(text)) {
+    // Drop the `[]` placeholder line together with its comment header;
+    // trailing comments (if any) stay in front of the managed block.
+    const lines = text.split(/\r?\n/);
+    const idx = lines.findIndex((line) => line.trim() === "[]");
+    if (idx !== -1) base = lines.slice(idx + 1).join("\n").trim();
+  }
+  base = base.length === 0 || base.endsWith("\n") ? base : base + "\n";
   await writeFile(patchFile, base + block, "utf8");
   return { written: true };
 }
@@ -177,6 +188,9 @@ export async function removeManagedBlock(profileDir) {
   // A start marker without its end marker: drop it through end of file.
   const unclosed = UNCLOSED_MANAGED_RE.exec(cleaned);
   if (unclosed) cleaned = cleaned.replace(unclosed[0], "");
+  // Removing the last entries must leave the official `[]` placeholder,
+  // not an empty file (matches the profile template).
+  cleaned = restoreEmptyArray(cleaned);
   await writeFile(patchFile, cleaned, "utf8");
   return matches.length;
 }

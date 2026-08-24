@@ -170,6 +170,15 @@ test("readPatchTopLevel: non-array top level is 'invalid'", () => {
   assert.equal(result.kind, "invalid");
 });
 
+test("readPatchTopLevel: a bare [] placeholder is an 'array' top level", () => {
+  assert.deepEqual(readPatchTopLevel("[]"), { ok: true, kind: "array" });
+  assert.deepEqual(readPatchTopLevel("[]\n"), { ok: true, kind: "array" });
+  assert.deepEqual(readPatchTopLevel("# comment\n[]"), {
+    ok: true,
+    kind: "array",
+  });
+});
+
 // --- writeManagedDisable / removeManagedBlock -------------------------------
 
 test("writeManagedDisable: appends a managed block to an empty patch", async (t) => {
@@ -225,6 +234,37 @@ test("writeManagedDisable: refuses a non-array top level", async (t) => {
   );
 });
 
+test("writeManagedDisable: replaces a bare [] placeholder with a valid YAML array", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
+  await writeFile(join(dir, "cordis.patch.yml"), "[]\n", "utf8");
+  const result = await writeManagedDisable(dir, "crashy");
+  assert.deepEqual(result, { written: true });
+  const text = await readFile(join(dir, "cordis.patch.yml"), "utf8");
+  assert.ok(!text.includes("[]"));
+  assert.equal(
+    text,
+    "# dshpkg:managed:start\n- id: crashy\n  disabled: true\n# dshpkg:managed:end\n",
+  );
+  // idempotent: the same id is not written twice
+  assert.deepEqual(await writeManagedDisable(dir, "crashy"), {
+    written: false,
+  });
+});
+
+test("writeManagedDisable: drops the [] placeholder together with its comment header", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
+  await writeFile(join(dir, "cordis.patch.yml"), "# user comment\n[]\n", "utf8");
+  const result = await writeManagedDisable(dir, "crashy");
+  assert.deepEqual(result, { written: true });
+  const text = await readFile(join(dir, "cordis.patch.yml"), "utf8");
+  assert.ok(!text.includes("[]"));
+  assert.ok(!text.includes("# user comment"));
+  assert.equal(
+    text,
+    "# dshpkg:managed:start\n- id: crashy\n  disabled: true\n# dshpkg:managed:end\n",
+  );
+});
+
 test("removeManagedBlock: removes only managed blocks, keeps user content", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
   const before =
@@ -249,6 +289,18 @@ test("removeManagedBlock: no-op when file missing or has no managed blocks", asy
   await writeFile(join(dir, "cordis.patch.yml"), original, "utf8");
   assert.equal(await removeManagedBlock(dir), 0);
   assert.equal(await readFile(join(dir, "cordis.patch.yml"), "utf8"), original);
+});
+
+test("removeManagedBlock: restores a bare [] after removing the only block", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
+  await writeFile(
+    join(dir, "cordis.patch.yml"),
+    "# dshpkg:managed:start\n- id: a\n  disabled: true\n# dshpkg:managed:end\n",
+    "utf8",
+  );
+  const removed = await removeManagedBlock(dir);
+  assert.equal(removed, 1);
+  assert.equal(await readFile(join(dir, "cordis.patch.yml"), "utf8"), "[]\n");
 });
 
 // --- supervise: healthy path ------------------------------------------------

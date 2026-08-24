@@ -56,6 +56,28 @@ test("applyDisableToPatch handles a patch without trailing newline", () => {
   assert.ok(out.endsWith("# dshpkg:managed:end\n"));
 });
 
+test("applyDisableToPatch replaces a bare [] placeholder with a valid array", () => {
+  const out = applyDisableToPatch("[]", "alpha");
+  assert.equal(out, buildDisableBlock("alpha"));
+  assert.ok(!out.includes("[]"));
+  const withNewline = applyDisableToPatch("[]\n", "alpha");
+  assert.equal(withNewline, buildDisableBlock("alpha"));
+  // idempotent on the placeholder path too
+  assert.equal(applyDisableToPatch(out, "alpha"), out);
+});
+
+test("applyDisableToPatch drops a [] placeholder with its comment header", () => {
+  const header = applyDisableToPatch("# user comment\n[]\n", "alpha");
+  assert.ok(!header.includes("[]"));
+  assert.ok(!header.includes("# user comment"));
+  assert.equal(header, buildDisableBlock("alpha"));
+  // trailing comments survive and stay ahead of the managed block
+  const tail = applyDisableToPatch("[]\n# trailing note\n", "alpha");
+  assert.ok(!tail.includes("[]"));
+  assert.ok(tail.includes("# trailing note"));
+  assert.ok(tail.endsWith("# dshpkg:managed:end\n"));
+});
+
 test("hasManagedBlock detects only blocks carrying the exact id line", () => {
   const patch = applyDisableToPatch("", "alpha");
   assert.equal(hasManagedBlock(patch, "alpha"), true);
@@ -85,6 +107,19 @@ test("removeManagedBlock only matches the exact dshpkg block shape", () => {
   const foreign = "# dshpkg:managed:start\n- id: alpha\n   disabled: true\n# dshpkg:managed:end\n";
   const out = removeManagedBlock(foreign, "alpha");
   assert.ok(out.includes("- id: alpha"));
+});
+
+test("removeManagedBlock restores a bare [] after removing the only block", () => {
+  const patch = applyDisableToPatch("[]", "alpha");
+  assert.equal(removeManagedBlock(patch, "alpha"), "[]\n");
+  // no block removed: text (including a bare []) stays untouched
+  assert.equal(removeManagedBlock("[]\n", "ghost"), "[]\n");
+});
+
+test("removeManagedBlock keeps comments when restoring the [] placeholder", () => {
+  const patch = "# user comment\n" + applyDisableToPatch("[]", "alpha");
+  const out = removeManagedBlock(patch, "alpha");
+  assert.equal(out, "# user comment\n[]\n");
 });
 
 test("rescueHtml renders a full Chinese dark-theme page with diagnostics and recovery", () => {
