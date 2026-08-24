@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { listSnapshots, resolveProfileDir, statePath } from "../lib/state.js";
+import { isProtected } from "../lib/protect.js";
 
 // --- tuning constants (exported for tests / documentation) -----------------
 
@@ -470,13 +471,20 @@ export async function supervise(
       });
 
       if (culprit) {
-        try {
-          await writeManagedDisable(profileDir, culprit.entryId);
-        } catch (err) {
-          emit("boot-failed", {
-            reason: "managed-write",
-            message: String(err?.message ?? err),
-          });
+        if (isProtected(culprit.entryId)) {
+          // Spec section 9: core entries must never be disabled. The failure
+          // counter and the restart/circuit loop proceed as usual — only the
+          // managed disable block write is skipped for protected entries.
+          emit("protected-blocked", { entryId: culprit.entryId });
+        } else {
+          try {
+            await writeManagedDisable(profileDir, culprit.entryId);
+          } catch (err) {
+            emit("boot-failed", {
+              reason: "managed-write",
+              message: String(err?.message ?? err),
+            });
+          }
         }
       }
 
@@ -580,6 +588,11 @@ function consoleReporter(profile, port) {
         } else {
           console.error("[dshpkg] 熔断后未找到可用快照，无法自动恢复");
         }
+        break;
+      case "protected-blocked":
+        console.error(
+          `[dshpkg] 肇事条目 "${detail.entryId ?? "?"}" 是核心条目，受保护，已跳过禁用标记（继续重启循环）`,
+        );
         break;
       default:
         break;

@@ -1,0 +1,146 @@
+# dshpkg
+
+dshpkg 是 DeepSeek Harness（dsh）的 **apt 风格插件管理器**，也是 dsh 的**自进化基座**：
+像 apt 一样用命令管理插件，并在插件把 harness 搞崩时**自动熔断、自动恢复**。
+
+- **仓库层**：AUR 式配方仓库，`dshpkg sync` 一键拉取
+- **稳定层**：事务安装（依赖闭包 → 预检 → 安装 → 冒烟，失败自动回滚）+ 已知良好快照
+- **受管层**：运行中热挂载 / 卸载插件（L2 host 服务，REST API）
+- **看门狗**：进程级守护，崩溃自动禁用肇事条目并重启（L3）
+
+依赖只有官方内核（`@deepseek-ai/cordis` 为 peer），零第三方运行时依赖，纯 ESM。
+
+## 四层架构
+
+```mermaid
+graph TB
+    subgraph L0[0 仓库层]
+        REPO[配方仓库 repos.json<br/>AUR 式 index + recipes]
+        INDEX[四源聚合索引<br/>GitHub / npm / awesome / 验证索引]
+    end
+    subgraph L1[1 稳定层]
+        TXN[事务安装 transaction.js<br/>闭包→预检→安装→冒烟→回滚]
+        SNAP[已知良好快照 snapshot.js<br/>package.json + patch + lock]
+        CIRCUIT[熔断器 circuit.js<br/>3 次崩溃开闸]
+    end
+    subgraph L2[2 受管层]
+        HOST[dshpkg host 服务 lib/index.js<br/>/dshpkg/status + managed API]
+        TOOLS[模型工具 plugin_search/install/toggle<br/>安装守卫 + /dshpkg 命令]
+    end
+    subgraph L3[3 看门狗]
+        SUP[supervisor 进程守护<br/>探活→triage→禁用→重启→快照恢复]
+    end
+    REPO --> TXN
+    INDEX --> SEARCH[search.js 三层搜索]
+    TXN --> SNAP
+    CIRCUIT --> HOST
+    HOST --> TOOLS
+    SUP --> CIRCUIT
+    SUP --> SNAP
+```
+
+- **0 仓库层**：`repo.js` 管理配方仓库（`repo add/remove/list/sync`），`indexer.js` 聚合 GitHub / npm / awesome-dsh-plugin / 验证索引四处数据源
+- **1 稳定层**：`transaction.js` 事务安装（失败自动回滚）、`snapshot.js` 已知良好快照、`circuit.js` 崩溃熔断器
+- **2 受管层**：`lib/index.js` 是 cordis 宿主插件，提供 `/dshpkg` REST API、热挂载（`managed.js`）、模型工具与安装守卫、Web UI 崩溃横幅
+- **3 看门狗**：`bin/supervisor.js` 守护 dsh 进程，启动失败自动 triage、禁用肇事条目并重启；连续失败自动从快照恢复
+
+## 安装
+
+dshpkg 以 profile 插件的形式挂载。**本地路径必须使用 `link:` 前缀**（官方 reconciler 只识别带 `link:` 的 bundle 声明，见 CONTRACTS.md 已验证事实）：
+
+```powershell
+# 1. 安装到目标 profile（web 为例）
+dsh plugin --profile web add "link:C:\path\to\dshpkg"
+
+# 2. 校验组合树（不启动 dsh，退出码 0 = 组合成功）
+dsh --profile web --dump-config
+
+# 3. 日常使用
+dshpkg sync            # 刷新配方仓库与索引
+dshpkg search <关键词> # 搜索插件
+dshpkg install <名称>  # 事务安装
+```
+
+## CLI 命令（21 个）
+
+| 命令 | 说明 |
+| --- | --- |
+| `search <关键词>` | 搜索插件（本地索引；`--online` 联网 GitHub/npm） |
+| `install <名称>` | 事务安装：闭包→预检→安装→冒烟，失败自动回滚 |
+| `remove <名称>` | 卸载插件 |
+| `update` / `sync` | 同步配方仓库并刷新插件索引（apt update 语义） |
+| `upgrade [名称]` | 升级全部或指定插件到最新版本 |
+| `hold <名称>` | 保持当前版本（upgrade 跳过它） |
+| `unhold <名称>` | 取消保持 |
+| `enable <名称>` | 启用插件（移除 cordis.patch.yml 禁用块） |
+| `disable <名称>` | 禁用插件（追加 cordis.patch.yml 禁用块） |
+| `status <名称>` | 插件状态：running / disabled / circuit-open |
+| `list` | 列出插件（`--installed` 仅看已安装） |
+| `info <名称>` | 配方详情、依赖与崩溃计数 |
+| `why <名称>` | 依赖反查：哪些配方依赖它 |
+| `doctor` | 校验组合树与依赖图（dsh --dump-config） |
+| `audit` | 最近 20 条崩溃记录 + 电路状态汇总 |
+| `fix-broken` | 交互式修复 circuit-open 的插件 |
+| `log` | 输出崩溃事件流（incidents.jsonl） |
+| `run` | 启动看门狗守护 dsh（`--port N` / `--profile 名`） |
+| `repo add/remove/list` | 添加 / 移除 / 列出配方仓库 |
+| `help` | 显示帮助 |
+
+常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`。
+
+## 自愈机制（三层熔断）
+
+1. **L2 熔断器**：`circuit.js` 记录每次崩溃；10 分钟窗口内 3 次 → 电路打开（`circuit-open`），`dshpkg audit` / Web UI 横幅可见，`dshpkg fix-broken` 或 REST `POST /dshpkg/circuit/close` 手动恢复
+2. **L3 看门狗**：`dshpkg run` 守护 dsh —— 启动失败时用 triage 正则解析 stderr 定位肇事条目，在 `cordis.patch.yml` 写入 `dshpkg:managed` 禁用块后重启；连续 3 次失败自动从最新快照恢复
+3. **核心保护名单**：`loader` / `include` / `cordis-host-runner` 等核心条目**永不熔断**——熔断核心只会让 harness 彻底无法启动，因此 host 服务与看门狗都会拒绝（`protected-blocked` 事件）
+
+自愈的每一步都会写入事件流（`incidents.jsonl`），`dshpkg log` 随时可查。
+
+## 模型工具与安装守卫
+
+dshpkg 在宿主内注册 3 个模型工具，让 AI 智能体以受控方式操作插件：
+
+- `plugin_search(query)` — 离线本地索引搜索，返回前 10 条中文摘要
+- `plugin_install(name)` — 走事务安装（预检 + 回滚），杜绝裸命令
+- `plugin_toggle(name)` — 按当前状态翻转启用/禁用（核心条目受保护）
+
+同时向系统提示词注入**安装守卫**规则：插件安装必须走 dshpkg CLI 或 `plugin_*` 工具，**禁止直接执行裸 `dsh plugin` / `pnpm add` 命令**；并提供 `/dshpkg` 斜杠命令（search / install / toggle 子命令）。这些注册全部防御式：服务缺失或接口形状不符时静默跳过，绝不影响宿主启动。
+
+## 状态目录
+
+所有状态都在 `~/.dsh/dshpkg/`（可用 `DSH_PKG_HOME` 覆盖）：
+
+```
+~/.dsh/dshpkg/
+├── state.json          # 插件簿记、崩溃计数、电路状态（R8 单一事实源）
+├── incidents.jsonl     # 崩溃事件流（dshpkg log / audit 的数据源）
+├── repos.json          # 配方仓库列表（优先级 = 顺序）
+├── recipes/<name>/     # sync 下来的配方仓库
+├── index/              # 四源聚合索引（items.json + meta.json）
+├── snapshots/          # 已知良好快照（保留最近 5 个，最新优先）
+└── managed/<name>/     # L2 受管条目（index.mjs + manifest.json + seq.json）
+```
+
+写操作全部原子化（同目录 tmp + rename，Windows 兼容，见 CONTRACTS.md R1）。
+
+## 诚实边界
+
+- **依赖官方通道**：安装/卸载经由 `dsh plugin --profile <name> add/remove`，dshpkg 不绕过官方 reconciler；本地路径必须 `link:` 前缀，否则 bundle 检测失败
+- **单机本地设计**：状态与快照都在本机 `~/.dsh/dshpkg/`，没有多机同步、没有签名验证基础设施；配方仓库内容靠仓库所有者的责任
+- **搜索默认离线**：`search` 只查本地索引，数据新不新取决于 `sync` 频率；`--online` 才联网，且联网失败静默回退本地索引
+- **自愈是尽力而为**：triage 依赖 dsh 固定的启动错误格式（CONTRACTS.md 已验证）；格式变化或非 loader 原因的崩溃（如端口占用）无法自动归因，看门狗会不断重启直到人工介入
+- **熔断不等于修复**：circuit-open 只是停止反复崩溃，`fix-broken` / 升级 / 卸载仍需人工决策
+- **模型工具是受控通道**：`plugin_install` 走完整事务（含预检回滚），但智能体仍可能通过普通 shell 工具绕过守卫——安装守卫是提示词级约束，不是沙箱级强制
+
+## 开发
+
+```powershell
+node --check lib/index.js bin/dshpkg.js bin/supervisor.js  # 语法检查
+node --test                                                # 单元测试（零联网）
+```
+
+测试约定：全部注入 fake（runner / fetcher / spawn / probe / clock），临时目录隔离状态，**绝不触碰真实 profile**。契约与裁决见 `CONTRACTS.md`。
+
+## License
+
+[MIT](./LICENSE)
