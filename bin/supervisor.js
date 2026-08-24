@@ -275,9 +275,9 @@ function parsePortFromArgs(args) {
  * Returns the snapshot timestamp (null when no snapshot exists).
  */
 async function restoreLatestSnapshot(profileDir) {
-  const snapshots = await listSnapshots(); // sorted ascending, newest last
+  const snapshots = await listSnapshots(); // newest first (state.js convention)
   if (snapshots.length === 0) return null;
-  const ts = snapshots[snapshots.length - 1];
+  const ts = snapshots[0];
   const dir = statePath("snapshots", ts);
   for (const name of ["package.json", "cordis.patch.yml", "pnpm-lock.yaml"]) {
     try {

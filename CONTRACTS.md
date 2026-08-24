@@ -220,3 +220,70 @@ export function apply(ctx) {}
 Commands: search/install/remove/update/upgrade/hold/enable/disable/status/
 list/info/why/doctor/audit/fix-broken/log/run/repo/sync. Wires A-J; lives on
 its own integration branch and is NOT part of the parallel batch.
+
+## Rulings (integration pass, appended after merge — history preserved above)
+
+Cross-module mismatches found while wiring the CLI; fixed with minimal edits
+on `main` and recorded here. Earlier contracts above are NOT modified.
+
+### R1. `writeJsonAtomic` tmp name must never embed the full path
+
+The original tmp name replaced `/`/`\\` in the full path, which put the
+Windows drive-letter colon (`C:`) into the file name; `rename()` then fails
+with EINVAL. Ruling: tmp name = `.` + basename + `.` + pid + `.` + timestamp +
+random + `.tmp`, created in the SAME directory as the target (atomicity kept).
+
+### R2. Test script is `node --test`, never `node --test tests/`
+
+`node --test tests/` makes Node 24.19 (Windows) load the directory as a
+module and die with MODULE_NOT_FOUND. Ruling: `"test": "node --test"` — the
+runner discovers `tests/*.test.js` itself.
+
+### R3. `listSnapshots` has ONE implementation, in state.js
+
+Both state.js (oldest-first, no filtering) and snapshot.js (newest-first)
+ship a `listSnapshots`; supervisor consumed `snapshots[length-1]` expecting
+oldest-first. Ruling: state.js owns the canonical implementation — newest
+FIRST, `.tmp` staging dirs skipped; snapshot.js re-exports it; supervisor
+reads `snapshots[0]` for the latest. Zero test changes were needed.
+
+### R4. Snapshot dir naming is opaque; both dot and dash forms restore
+
+`saveSnapshot` writes sanitized ISO dirs (`:` and `.` become `-`, e.g.
+`2026-08-24T00-00-00-000Z`); supervisor tests reference dot-style names
+(`2026-08-24T00.00.00.000Z`). Ruling: dir names are opaque; `restoreSnapshot`
+accepts both raw ISO and sanitized names. Compatible, no code change.
+
+### R5. Recipe `source` may be `{type, spec}` or a plain string
+
+lib/recipe.js recipes carry `source: {type, spec}`; the transaction contract
+assumed a string. Ruling: `transaction.js` normalizes via an internal
+`sourceOf()` — a string passes through, an object resolves to its `spec`.
+Both shapes stay valid everywhere.
+
+### R6. Supervisor tolerant recovery vs snapshot.js strict recovery coexist
+
+supervisor keeps its own best-effort restore (skips missing optional files;
+a watchdog must not fail the boot loop), snapshot.js restore stays strict
+(all three files required before touching the profile). Ruling: two intents —
+watchdog = degrade gracefully, explicit user restore = refuse partial state.
+
+### R7. Host gains POST /dshpkg/managed/enable|disable
+
+The CLI's L2 path (HTTP mode when a host answers on the probed port) needs
+enable/disable endpoints; only mount/unmount existed. Ruling: two new routes
+added to lib/index.js sharing the `setEntryDisabled(name, disabled)` API;
+file mode (rescue.js managed blocks) remains the offline fallback.
+
+### R8. CLI owns state.packages bookkeeping
+
+install/remove/upgrade/hold/unhold maintain `state.packages[name]`
+({source, version, kind, installedAt, held, crashCount, crashTimes,
+circuitOpenAt}) in state.json so status/list/info/audit/upgrade have a single
+truth even when the recipe repo is offline.
+
+### R9. String deps in recipes install by bare name
+
+`resolveEntries` treats string deps as plain specs (installed as the name
+itself, no recipe lookup). Only object deps recurse. This is the intended
+semantic: a recipe may depend on packages that have no recipe.
