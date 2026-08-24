@@ -247,15 +247,49 @@ function resolveLauncherBin() {
   return null;
 }
 
-/** Default child spawn: node <launcherBin> --profile <profile> ...args. */
+/**
+ * Default child spawn:
+ *   node <launcherBin> --profile <profile> [--port <port>] <app args...>
+ *
+ * The dsh launcher stops parsing its own flags at the first unknown token,
+ * so launcher flags (--profile) must precede app args (--port and the rest).
+ * Any --profile / --port pair already present in `args` (preserved verbatim
+ * by parseCliArgs) is moved to its canonical slot instead of duplicated.
+ */
 function defaultSpawn({ launcherBin, profile, args }) {
   if (!launcherBin) {
     throw new Error(
       "未找到 dsh 全局入口（可设置 DSH_LAUNCHER 指向 @deepseek-ai/dsh/lib/bin.js）",
     );
   }
+  let portPair = [];
+  const rest = [];
+  let afterDash = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (afterDash) {
+      // Everything after "--" belongs to the app, verbatim.
+      rest.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      afterDash = true;
+      rest.push(arg);
+    } else if (arg === "--port" && i + 1 < args.length) {
+      portPair = ["--port", args[i + 1]];
+      i += 1;
+    } else if (arg.startsWith("--port=")) {
+      portPair = [arg];
+    } else if (arg === "--profile" && i + 1 < args.length) {
+      i += 1; // canonical --profile pair added below instead
+    } else if (arg.startsWith("--profile=")) {
+      // canonical --profile pair added below instead
+    } else {
+      rest.push(arg);
+    }
+  }
   // Never shell:true — always spawn node with the launcher script path.
-  return spawn("node", [launcherBin, "--profile", profile, ...args], {
+  return spawn("node", [launcherBin, "--profile", profile, ...portPair, ...rest], {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -366,10 +400,18 @@ export async function supervise(
     if (stopped) return;
 
     const port = portOption ?? parsePortFromArgs(args) ?? 3080;
+    // A --port pair inside args is forwarded as-is. When the probe port came
+    // from an explicit option instead, append the pair to the spawn args so
+    // the dsh child binds exactly the port we probe (E2E finding: probing
+    // 3199 while dsh binds its 3080 default makes every probe fail).
+    const spawnArgs =
+      portOption != null && parsePortFromArgs(args) == null
+        ? [...args, "--port", String(port)]
+        : args;
     // Resolve the launcher lazily: injected spawnImpl never touches npm.
     const launcherBin = spawnImpl ? null : resolveLauncherBin();
     const doSpawn =
-      spawnImpl ?? (() => defaultSpawn({ launcherBin, profile, args }));
+      spawnImpl ?? (() => defaultSpawn({ launcherBin, profile, args: spawnArgs }));
     const doProbe = probeImpl ?? defaultProbe;
     const doSleep = sleepImpl ?? defaultSleep;
 
@@ -389,7 +431,7 @@ export async function supervise(
       let stderrText = "";
       let exitedPromise;
       try {
-        child = await doSpawn({ launcherBin, profile, args });
+        child = await doSpawn({ launcherBin, profile, args: spawnArgs });
         if (!child) throw new Error("spawn 返回空子进程");
       } catch (err) {
         emit("boot-failed", {
@@ -536,7 +578,11 @@ export async function supervise(
 
 // --- CLI entry (invoked by supervisor.ps1) ----------------------------------
 
-function parseCliArgs(argv) {
+// --profile and --port are also legal dsh flags (the launcher needs
+// --profile; the web app needs --port), so besides parsing them into opts
+// they are preserved verbatim in opts.args for passthrough to the child.
+// --health-path is supervisor-only and must NOT reach the dsh child.
+export function parseCliArgs(argv) {
   const opts = { profile: "web", port: null, healthPath: "/", args: [] };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -549,12 +595,17 @@ function parseCliArgs(argv) {
       passthrough = true;
     } else if (arg === "--profile" && argv[i + 1] !== undefined) {
       opts.profile = argv[++i];
+      opts.args.push("--profile", opts.profile);
     } else if (arg.startsWith("--profile=")) {
       opts.profile = arg.slice("--profile=".length);
+      opts.args.push(arg);
     } else if (arg === "--port" && argv[i + 1] !== undefined) {
-      opts.port = Number(argv[++i]);
+      const value = argv[++i];
+      opts.port = Number(value);
+      opts.args.push("--port", value);
     } else if (arg.startsWith("--port=")) {
       opts.port = Number(arg.slice("--port=".length));
+      opts.args.push(arg);
     } else if (arg === "--health-path" && argv[i + 1] !== undefined) {
       opts.healthPath = argv[++i];
     } else if (arg.startsWith("--health-path=")) {

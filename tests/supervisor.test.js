@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 import {
   supervise,
+  parseCliArgs,
   parseLoaderErrors,
   readPatchTopLevel,
   writeManagedDisable,
@@ -532,6 +533,64 @@ test("supervise: probe port comes from --port arg, option, or 3080 default", asy
     ["default", 3080],
     ["option", 4000],
   ]);
+});
+
+// --- parseCliArgs: supervisor flags vs dsh passthrough ---------------------
+
+test("parseCliArgs: --profile/--port parse AND stay in args for dsh passthrough", () => {
+  const opts = parseCliArgs(["--profile", "web", "--port", "3199"]);
+  assert.equal(opts.profile, "web");
+  assert.equal(opts.port, 3199);
+  // Both pairs are forwarded verbatim: dsh needs --profile (launcher flag)
+  // and --port (web app flag) to bind the same port the supervisor probes.
+  assert.deepEqual(opts.args, ["--profile", "web", "--port", "3199"]);
+});
+
+test("parseCliArgs: = forms of --profile/--port also stay in args", () => {
+  const opts = parseCliArgs(["--profile=web", "--port=3199"]);
+  assert.equal(opts.profile, "web");
+  assert.equal(opts.port, 3199);
+  assert.deepEqual(opts.args, ["--profile=web", "--port=3199"]);
+});
+
+test("parseCliArgs: --health-path is supervisor-only and never enters args", () => {
+  const opts = parseCliArgs(["--health-path", "/healthz"]);
+  assert.equal(opts.healthPath, "/healthz");
+  assert.deepEqual(opts.args, []);
+  const optsEq = parseCliArgs(["--health-path=/healthz"]);
+  assert.equal(optsEq.healthPath, "/healthz");
+  assert.deepEqual(optsEq.args, []);
+});
+
+// --- supervise: explicit port option reaches the dsh child ------------------
+
+test("supervise: explicit port option appends --port to the spawn args", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  const events = [];
+  const spawnCalls = [];
+  const run = supervise({
+    profile: "web",
+    port: 3199,
+    args: [], // no --port pair here: the option must be forwarded on its own
+    onEvent: (event) => events.push(event),
+    spawnImpl: async (spawnOpts) => {
+      spawnCalls.push(spawnOpts);
+      return fakeChild();
+    },
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  assert.equal(spawnCalls.length, 1);
+  const idx = spawnCalls[0].args.indexOf("--port");
+  assert.notEqual(idx, -1);
+  assert.equal(spawnCalls[0].args[idx + 1], "3199");
 });
 
 // --- supervise: hung child (probe failures) is killed and restarted ---------
