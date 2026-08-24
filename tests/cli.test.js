@@ -449,6 +449,59 @@ test("enable goes through the running host when probe succeeds", async (t) => {
   assert.ok(posts[0].url.endsWith(`/dshpkg/managed/enable`));
 });
 
+// --- enable / disable protect list (Spec section 9) ------------------------
+
+test("disable rejects a protected core entry and leaves the patch untouched", async (t) => {
+  const patch = "- id: user-entry\n  disabled: false\n";
+  const { home } = await makeEnv(t, { patch });
+  const { io, errors } = captureIo({ fetcher: noHostFetcher });
+  const code = await runCli(["disable", "loader", "--profile", "web"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("核心条目受保护，禁止熔断/禁用"));
+  const after = await readFile(join(home, "profiles", "web", "cordis.patch.yml"), "utf8");
+  assert.equal(after, patch); // nothing was written
+});
+
+test("disable a protected core entry never reaches the running host either", async (t) => {
+  await makeEnv(t);
+  const { fetcher, posts } = fakeHostFetcher({ managed: [] });
+  const { io, errors } = captureIo({ fetcher });
+  const code = await runCli(["disable", "cordis-host-runner"], io);
+  assert.equal(code, 1);
+  assert.equal(posts.length, 0); // gate fires before the host probe/route
+  assert.ok(errors.join("\n").includes("核心条目受保护，禁止熔断/禁用"));
+});
+
+test("disable a non-protected entry is not blocked by the protect list", async (t) => {
+  await makeEnv(t, { patch: "- id: user-entry\n  disabled: false\n" });
+  const { io, logs } = captureIo({ fetcher: noHostFetcher });
+  const code = await runCli(["disable", "dsh-plugin-x"], io);
+  assert.equal(code, 0);
+  const patch = await readFile(join(process.env.DSH_HOME, "profiles", "web", "cordis.patch.yml"), "utf8");
+  assert.ok(patch.includes("dshpkg:managed:start"));
+  assert.ok(patch.includes("dsh-plugin-x"));
+  assert.ok(logs.join("\n").includes("禁用"));
+});
+
+test("enable restores a protected core entry (restore is never blocked)", async (t) => {
+  const patch = [
+    "- id: user-entry",
+    "  disabled: false",
+    "# dshpkg:managed:start",
+    "- id: loader",
+    "  disabled: true",
+    "# dshpkg:managed:end",
+    "",
+  ].join("\n");
+  const { home } = await makeEnv(t, { patch });
+  const { io, logs } = captureIo({ fetcher: noHostFetcher });
+  const code = await runCli(["enable", "loader"], io);
+  assert.equal(code, 0);
+  const updated = await readFile(join(home, "profiles", "web", "cordis.patch.yml"), "utf8");
+  assert.ok(!updated.includes("dshpkg:managed:start"));
+  assert.ok(logs.join("\n").includes("启用"));
+});
+
 // ------------------------------------------------------------------- status
 
 test("status reports circuit-open for a tripped package", async (t) => {

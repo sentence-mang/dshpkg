@@ -37,6 +37,7 @@ import {
 import { refreshIndex } from "../lib/indexer.js";
 import { install, remove, defaultRunner } from "../lib/transaction.js";
 import { isOpen, closeCircuit } from "../lib/circuit.js";
+import { isProtected } from "../lib/protect.js";
 import {
   hasManagedBlock,
   applyDisableToPatch,
@@ -417,6 +418,13 @@ async function setPluginDisabled(ctx, args, opts, disabled) {
   try {
     const name = String(args[0] ?? "").trim();
     if (!name) throw new Error("用法: dshpkg enable|disable <名称>");
+    // Spec section 9: core entries must never be disabled. The protect list
+    // only blocks the disable/circuit-open direction — enable (removing a
+    // managed disable block) is a restore and stays unrestricted, matching
+    // the fix-broken recovery path.
+    if (disabled && isProtected(name)) {
+      throw new Error(`核心条目受保护，禁止熔断/禁用（${name}）`);
+    }
     const state = await readState();
     const profile = opts.profile ?? state.profile ?? "web";
     const port = opts.port ?? HOST_PORT;

@@ -18,6 +18,8 @@ import {
   supervise,
   parseCliArgs,
   parseLoaderErrors,
+  parseUncaughtModule,
+  resolveEntryByPackage,
   readPatchTopLevel,
   writeManagedDisable,
   removeManagedBlock,
@@ -28,6 +30,13 @@ const EXACT_CRASH_TEXT =
   "failed to apply loader entry boot-crash-fixture (dshpkg-fixture-boot-crash): boot-crash fixture: intentional boot failure";
 // Outer wrapper adds one nesting level (cordis:include names the wrapper).
 const NESTED_CRASH_TEXT = `failed to apply loader entry include (cordis:include): ${EXACT_CRASH_TEXT}`;
+// Real E2E stderr of the sync-crash fixture: a plain uncaughtException stack
+// (no "failed to apply loader entry" message) — only the node_modules path
+// segment reveals the culprit package.
+const SYNC_CRASH_STACK = [
+  "Error: sync-crash fixture: intentional uncaughtException",
+  "    at Timeout._onTimeout (file:///C:/Users/Sente/.dsh/profiles/dshpkg-poc/node_modules/dshpkg-fixture-sync-crash/index.js:7:11)",
+].join("\n");
 
 // --- helpers ---------------------------------------------------------------
 
@@ -142,6 +151,106 @@ test("parseLoaderErrors: supports all four stages", () => {
   ].join("\n");
   const stages = parseLoaderErrors(text).map((m) => m.stage);
   assert.deepEqual(stages, ["import", "dispose", "rollback"]);
+});
+
+// --- parseUncaughtModule ---------------------------------------------------
+
+test("parseUncaughtModule: extracts the package from the real sync-crash stack", () => {
+  assert.deepEqual(parseUncaughtModule(SYNC_CRASH_STACK), [
+    "dshpkg-fixture-sync-crash",
+  ]);
+});
+
+test("parseUncaughtModule: scoped packages and backslash separators", () => {
+  const text = [
+    "Error: boom",
+    "    at fn (file:///x/node_modules/@deepseek-ai/dsh-base/lib/bin.js:1:1)",
+    "    at fn2 (C:\\Users\\Sente\\.dsh\\profiles\\web\\node_modules\\dshpkg-fixture-sync-crash\\index.js:7:11)",
+  ].join("\n");
+  assert.deepEqual(parseUncaughtModule(text), [
+    "@deepseek-ai/dsh-base",
+    "dshpkg-fixture-sync-crash",
+  ]);
+});
+
+test("parseUncaughtModule: dedupes and ranks by occurrence frequency", () => {
+  const text = [
+    "Error: boom",
+    "    at a (/x/node_modules/pkg-a/index.js:1:1)",
+    "    at b (/x/node_modules/pkg-b/index.js:2:2)",
+    "    at c (/x/node_modules/pkg-a/helper.js:3:3)",
+  ].join("\n");
+  assert.deepEqual(parseUncaughtModule(text), ["pkg-a", "pkg-b"]);
+});
+
+test("parseUncaughtModule: skips pnpm virtual-store (.pnpm) segments", () => {
+  const text = [
+    "Error: boom",
+    "    at fn (/x/node_modules/.pnpm/pkg-a@1.0.0/node_modules/pkg-a/index.js:1:1)",
+  ].join("\n");
+  assert.deepEqual(parseUncaughtModule(text), ["pkg-a"]);
+});
+
+test("parseUncaughtModule: no stack frames falls back to []", () => {
+  assert.deepEqual(parseUncaughtModule(""), []);
+  assert.deepEqual(parseUncaughtModule(null), []);
+  assert.deepEqual(parseUncaughtModule("plain text without at-frames\n"), []);
+  assert.deepEqual(
+    parseUncaughtModule("Error: boom\n    at Timeout._onTimeout (node:internal/timers:501:7)\n"),
+    [],
+  );
+});
+
+// --- resolveEntryByPackage --------------------------------------------------
+
+test("resolveEntryByPackage: reads the package's own cordis.patch.yml", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-resolve-"));
+  await mkdir(join(dir, "node_modules", "dshpkg-fixture-sync-crash"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(dir, "node_modules", "dshpkg-fixture-sync-crash", "cordis.patch.yml"),
+    "- insert:\n    - id: sync-crash-fixture\n      name: dshpkg-fixture-sync-crash\n",
+    "utf8",
+  );
+  assert.equal(
+    await resolveEntryByPackage(dir, "dshpkg-fixture-sync-crash"),
+    "sync-crash-fixture",
+  );
+});
+
+test("resolveEntryByPackage: falls back to dsh.profile.bundles (link: fixture path)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-resolve-"));
+  const fixtureDir = join(dir, "linked-fixture");
+  await mkdir(fixtureDir, { recursive: true });
+  await writeFile(
+    join(fixtureDir, "cordis.patch.yml"),
+    "- insert:\n    - id: linked-fixture-entry\n      name: linked-fixture\n",
+    "utf8",
+  );
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "fake-profile",
+      dsh: { profile: { bundles: [`file:${fixtureDir}`] } },
+    }),
+    "utf8",
+  );
+  // no node_modules/<pkg>/ file: only the bundle path can resolve it
+  assert.equal(
+    await resolveEntryByPackage(dir, "linked-fixture"),
+    "linked-fixture-entry",
+  );
+});
+
+test("resolveEntryByPackage: returns null when nothing resolves", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-resolve-"));
+  await writeFile(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "fake-profile", dsh: { profile: { bundles: [] } } }),
+    "utf8",
+  );
+  assert.equal(await resolveEntryByPackage(dir, "no-such-package"), null);
 });
 
 // --- readPatchTopLevel -----------------------------------------------------
@@ -387,6 +496,72 @@ test("supervise: triage hit disables the culprit and restarts", async (t) => {
   const bootFailed = events.find((e) => e.type === "boot-failed");
   // innermost culprit wins over the cordis:include wrapper
   assert.equal(bootFailed.detail.entryId, "boot-crash-fixture");
+  assert.equal(children.length, 2);
+});
+
+// --- supervise: uncaughtException stack attribution (sync-crash) ------------
+
+test("supervise: sync-crash uncaughtException is attributed and disabled", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  // The culprit package lives in the fake profile's node_modules.
+  await mkdir(join(profileDir, "node_modules", "dshpkg-fixture-sync-crash"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(profileDir, "node_modules", "dshpkg-fixture-sync-crash", "cordis.patch.yml"),
+    "- insert:\n    - id: sync-crash-fixture\n      name: dshpkg-fixture-sync-crash\n",
+    "utf8",
+  );
+
+  const events = [];
+  const children = [];
+  let graceCalls = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    // First child dies with the real sync-crash uncaughtException stack;
+    // every later child stays alive.
+    sleepImpl: async () => {
+      const index = graceCalls;
+      graceCalls += 1;
+      const child = children[index];
+      if (child && index === 0) {
+        child.stderr.emit("data", SYNC_CRASH_STACK);
+        child.emit("exit", 1, null);
+      }
+    },
+  });
+  // Wait for the restart to settle (second spawn healthy), then stop.
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
+  assert.match(patch, /# dshpkg:managed:start/);
+  assert.match(patch, /- id: sync-crash-fixture/);
+  assert.match(patch, /disabled: true/);
+  assert.match(patch, /# dshpkg:managed:end/);
+  // original user content untouched
+  assert.match(patch, /- id: original-entry/);
+
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("boot-failed"));
+  assert.ok(types.includes("restarting"));
+  assert.ok(types.includes("healthy"));
+  assert.equal(types.includes("circuit-open"), false);
+
+  const bootFailed = events.find((e) => e.type === "boot-failed");
+  assert.equal(bootFailed.detail.entryId, "sync-crash-fixture");
+  assert.ok(bootFailed.detail.detail.includes("sync-crash fixture"));
   assert.equal(children.length, 2);
 });
 

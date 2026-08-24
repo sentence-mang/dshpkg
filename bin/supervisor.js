@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { listSnapshots, resolveProfileDir, statePath } from "../lib/state.js";
+import { listSnapshots, resolveProfileDir, statePath, readJson } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
 
@@ -79,6 +79,125 @@ export function parseLoaderErrors(text) {
     re.lastIndex -= match[4].length;
   }
   return out;
+}
+
+// --- triage: uncaughtException stack attribution ----------------------------
+
+// Sync-crash class: the child dies from an uncaught exception without any
+// "failed to apply loader entry" kernel message, so parseLoaderErrors misses
+// and the watchdog would restore a snapshot instead of circuit-opening the
+// culprit. The stack trace still names the file the throw happened in;
+// extracting node_modules/<pkg>/ path segments recovers the package name.
+const NODE_MODULES_SEGMENT_RE =
+  /node_modules[\\/](@[^\\/]+[\\/][^\\/]+|[^\\/]+)[\\/]/g;
+
+/**
+ * Extract candidate package names from an stderr tail by scanning stack
+ * frames ("at ..." lines) for node_modules/<pkg>/ and node_modules/@scope/
+ * <name>/ path segments. Candidates are deduped and sorted by occurrence
+ * frequency (ties keep first-seen order); internal entries such as the
+ * pnpm virtual store (.pnpm) are skipped.
+ *
+ * @param {string} stderrText stderr tail or any text; null-safe
+ * @returns {string[]} candidate package names, most frequent first
+ */
+export function parseUncaughtModule(stderrText) {
+  if (typeof stderrText !== "string" || stderrText.length === 0) return [];
+  const counts = new Map();
+  for (const line of stderrText.split(/\r?\n/)) {
+    if (!/^\s*at\s+/.test(line)) continue;
+    for (const match of line.matchAll(NODE_MODULES_SEGMENT_RE)) {
+      const name = match[1];
+      if (!name || name.startsWith(".")) continue; // .pnpm virtual store etc.
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name]) => name);
+}
+
+// Quote handling for a YAML scalar read from a patch line.
+function unquoteYamlScalar(value) {
+  let v = String(value ?? "").trim();
+  if (v.length >= 2 && v[0] === "'" && v[v.length - 1] === "'") {
+    v = v.slice(1, -1).replace(/''/g, "'");
+  } else if (v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"') {
+    v = v.slice(1, -1);
+  }
+  return v;
+}
+
+// First `- id: <value>` line inside a package's own cordis.patch.yml (the
+// official bundle patch shape is `- insert: [{ id, name }]`).
+function extractInsertEntryId(patchText) {
+  if (!patchText) return null;
+  for (const line of String(patchText).split(/\r?\n/)) {
+    const match = /^[ \t]*-[ \t]+id:[ \t]*(.+?)[ \t]*(?:#.*)?$/.exec(line);
+    if (match) return unquoteYamlScalar(match[1]);
+  }
+  return null;
+}
+
+/** Read a text file; a missing file reads as "". */
+async function readTextOrEmpty(file) {
+  try {
+    return await readFile(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Resolve a package name (from an uncaughtException stack frame) to the
+ * loader entry id it inserts, fully offline:
+ *   1. read <profileDir>/node_modules/<pkgName>/cordis.patch.yml and extract
+ *      the insert entry id;
+ *   2. fall back to <profileDir>/package.json dsh.profile.bundles: bundle
+ *      entries matching the package name (exact or @version-suffixed) are
+ *      scanned under node_modules; local-path bundle entries (file:/link:/
+ *      absolute/relative paths, e.g. linked fixtures) are scanned directly;
+ *   3. both fail -> null.
+ *
+ * @param {string} profileDir absolute profile directory
+ * @param {string} pkgName package name from the stack trace
+ * @returns {Promise<string|null>} loader entry id, or null
+ */
+export async function resolveEntryByPackage(profileDir, pkgName) {
+  const looksLikePath = (value) =>
+    /^[a-zA-Z]:[\\/]/.test(value) ||
+    value.startsWith("/") ||
+    value.startsWith("./") ||
+    value.startsWith("../") ||
+    value.startsWith(".\\") ||
+    value.startsWith("..\\");
+  const targets = [{ kind: "pkg", value: pkgName }];
+  const manifest = await readJson(join(profileDir, "package.json"), null);
+  const bundles = Array.isArray(manifest?.dsh?.profile?.bundles)
+    ? manifest.dsh.profile.bundles
+    : [];
+  for (const bundle of bundles) {
+    const raw = String(bundle ?? "").trim();
+    if (!raw) continue;
+    const bare = raw.replace(/^(link:|file:)/, "");
+    if (bare === pkgName || bare.startsWith(`${pkgName}@`)) {
+      // Bundle entries may carry a version suffix (pkg@1.0.0): the
+      // filesystem directory is always the bare package name.
+      targets.push({ kind: "pkg", value: bare.replace(/@[^@/]+$/, "") });
+    } else if (looksLikePath(bare)) {
+      // Linked fixtures live outside node_modules: scan them directly.
+      targets.push({ kind: "dir", value: bare });
+    }
+  }
+  for (const target of targets) {
+    const file =
+      target.kind === "dir"
+        ? join(target.value, "cordis.patch.yml")
+        : join(profileDir, "node_modules", target.value, "cordis.patch.yml");
+    const entryId = extractInsertEntryId(await readTextOrEmpty(file));
+    if (entryId) return entryId;
+  }
+  return null;
 }
 
 // --- cordis.patch.yml helpers (exported for tests) --------------------------
@@ -516,8 +635,31 @@ export async function supervise(
         break;
       }
 
-      const triaged = parseLoaderErrors(stdoutText + stderrText);
-      const culprit = triaged.length > 0 ? triaged[triaged.length - 1] : null;
+      // Attribution order (E2E finding: sync-crash uncaughtException):
+      // 1) loader errors, 2) uncaughtException stack package -> entry id,
+      // 3) null (failure counter then climbs to the snapshot path).
+      const output = stdoutText + stderrText;
+      const triaged = parseLoaderErrors(output);
+      let culprit = triaged.length > 0 ? triaged[triaged.length - 1] : null;
+      if (!culprit) {
+        for (const candidate of parseUncaughtModule(output)) {
+          const entryId = await resolveEntryByPackage(profileDir, candidate);
+          if (entryId) {
+            const firstLine =
+              String(stderrText)
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .find((line) => line.length > 0) ?? "";
+            culprit = {
+              stage: "uncaughtException",
+              entryId,
+              entryName: candidate,
+              detail: firstLine,
+            };
+            break;
+          }
+        }
+      }
       consecutiveBootFailures += 1;
       emit("boot-failed", {
         code,
@@ -629,7 +771,7 @@ function consoleReporter(profile, port) {
       case "boot-failed":
         if (detail.entryId) {
           console.error(
-            `[dshpkg] 启动失败：loader 条目 "${detail.entryId}" 出错（${detail.detail ?? ""}），已写入禁用标记`,
+            `[dshpkg] 启动失败：条目 "${detail.entryId}" 出错（${detail.detail ?? ""}），已写入禁用标记`,
           );
         } else {
           console.error(
