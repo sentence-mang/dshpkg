@@ -34,7 +34,7 @@ import {
   syncRepos,
   loadAllRecipes,
 } from "../lib/repo.js";
-import { refreshIndex } from "../lib/indexer.js";
+import { refreshIndex, readIndex } from "../lib/indexer.js";
 import { install, remove, defaultRunner, defaultInstallRunner } from "../lib/transaction.js";
 import { isOpen, closeCircuit } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
@@ -213,14 +213,209 @@ function transactionRecipe(recipe) {
   return entry;
 }
 
+// --- smart install resolution (fuzzy word -> candidate -> install) ---------
+
+/** True for remote git specs (github:/git+/git@/ssh:/https:/ .git urls). */
+function isRemoteGitSpec(spec) {
+  const s = String(spec).trim();
+  return /^(https?:\/\/|git@|git\+|ssh:|github:)/i.test(s) || /\.git(?:[#@\/]|$)/.test(s);
+}
+
+/** True for local filesystem path specs (absolute, drive or ./ ../ relative). */
+function isLocalPathSpec(spec) {
+  const s = String(spec).trim().replace(/^(link:|file:)/, "");
+  return (
+    /^[a-zA-Z]:[\\/]/.test(s) ||
+    s.startsWith("/") ||
+    s.startsWith("./") ||
+    s.startsWith("../") ||
+    s.startsWith(".\\") ||
+    s.startsWith("..\\")
+  );
+}
+
+/**
+ * True for specs that unambiguously target npm and must bypass the fuzzy
+ * search chain: an explicit `npm:` prefix, a scoped `@scope/name`, a version
+ * pin (`name@version`), or a bare word already following the dsh ecosystem
+ * naming convention (dsh-prefixed or containing "dsh-") — such words ARE the
+ * exact package names, so historical direct-install behaviour is preserved.
+ */
+function isDirectNpmSpec(spec) {
+  const s = String(spec).trim();
+  if (!s) return false;
+  if (/^npm:/i.test(s)) return true;
+  if (/^@[^/\s]+\//.test(s)) return true; // scoped package
+  if (!s.startsWith("@") && versionOf(s)) return true; // name@version pin
+  const lower = s.toLowerCase();
+  return lower.startsWith("dsh") || lower.includes("dsh-");
+}
+
+/** dsh-ecosystem search candidate: packageName starts with "dsh" or name has it. */
+function isEcosystemCandidate(item) {
+  const pkg = String(item?.packageName ?? "").toLowerCase();
+  const name = String(item?.name ?? item?.key ?? "").toLowerCase();
+  return pkg.startsWith("dsh") || name.includes("dsh");
+}
+
+/** Display name of a search result entry (name > packageName > key). */
+function candidateNameOf(item) {
+  return String(item?.name ?? item?.packageName ?? item?.key ?? "").trim();
+}
+
+/**
+ * Install spec derived from a search result: the npm package name when it has
+ * one, else `github:owner/repo` for GitHub-hosted hits, else the bare name.
+ */
+function candidateSpecOf(item) {
+  const pkg = String(item?.packageName ?? "").trim();
+  if (pkg) return pkg;
+  const ownerRepo = String(item?.ownerRepo ?? "").trim().replace(/\.git$/i, "");
+  if (ownerRepo) return `github:${ownerRepo}`;
+  return candidateNameOf(item);
+}
+
+/** Truncate text to a display width (CJK-aware), appending an ellipsis. */
+function truncateDisplay(text, maxWidth) {
+  const s = String(text ?? "");
+  if (displayWidth(s) <= maxWidth) return s;
+  let width = 0;
+  let out = "";
+  for (const ch of s) {
+    const w = /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/.test(ch) ? 2 : 1;
+    if (width + w > maxWidth - 1) return `${out}…`;
+    width += w;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Resolve a bare fuzzy word into an install target via the search chain:
+ * local index first (ecosystemOnly passed duck-typed — search.js ignores
+ * unknown options until it adopts the parameter), one automatic online retry
+ * when the local index is empty, then a strong-match check (exact name hit,
+ * or a lone dsh-ecosystem candidate leading the runner-up by >= 30 points).
+ * Multiple candidates fall back to an interactive numbered list (max 10;
+ * non-TTY prints the list and exits 2, --yes auto-picks the first).
+ *
+ * @returns {Promise<number|{target: string|object, name: string,
+ *   recipe: object|null, recordSpec: string}>} a number is an exit code
+ *   (0 cancelled, 1 zero candidates, 2 ambiguous in non-interactive mode).
+ */
+async function resolveSmartInstall(ctx, spec, profile, opts) {
+  const searchImpl = ctx.search ?? search;
+  const doSearch = (online) =>
+    searchImpl(spec, {
+      online,
+      profile,
+      // Duck-typed hint for the offline pass: search.js ignores unknown
+      // options until it adopts the parameter, so this stays crash-free.
+      // The online retry stays broad — CLI-side ordering handles it.
+      ...(online ? {} : { ecosystemOnly: true }),
+      ...(ctx.fetcher ? { fetcher: ctx.fetcher } : {}),
+    });
+
+  let candidates = await doSearch(false);
+  if (!Array.isArray(candidates)) candidates = [];
+  if (candidates.length === 0) {
+    // Empty local index (never refreshed / fresh install): retry online once.
+    // Inside search, a GitHub failure degrades to npm, and a total online
+    // failure degrades back to the (empty) local result — never throws.
+    const index = await readIndex();
+    if (!Array.isArray(index) || index.length === 0) {
+      const online = await doSearch(true);
+      if (Array.isArray(online)) candidates = online;
+    }
+  }
+
+  if (candidates.length === 0) {
+    ctx.error(
+      `未找到匹配 "${spec}" 的插件，试试 dshpkg search ${spec} 或先运行 dshpkg update 刷新索引`,
+    );
+    return 1;
+  }
+
+  // CLI-side ecosystem ordering: dsh candidates first, score order kept.
+  const eco = candidates.filter(isEcosystemCandidate);
+  const ordered = [...eco, ...candidates.filter((r) => !isEcosystemCandidate(r))];
+  const q = String(spec).toLowerCase();
+
+  let pick = ordered.find(
+    (r) =>
+      String(r?.packageName ?? "").toLowerCase() === q ||
+      candidateNameOf(r).toLowerCase() === q,
+  ) ?? null;
+  if (!pick && eco.length === 1) {
+    const runnerUp = ordered.length > 1 ? ordered[1] : null;
+    if (!runnerUp || (Number(eco[0].score) || 0) >= (Number(runnerUp.score) || 0) + 30) {
+      pick = eco[0];
+    }
+  }
+
+  if (pick) {
+    ctx.log(`已匹配：${candidateNameOf(pick)}（来自搜索）`);
+  } else if (opts.yes) {
+    pick = ordered[0];
+    ctx.log(`已匹配：${candidateNameOf(pick)}（来自搜索，--yes 自动选择第 1 名）`);
+  } else {
+    // Multiple viable candidates: numbered list (max 10), interactive pick.
+    const shown = ordered.slice(0, 10);
+    const rows = shown.map((r, i) => [
+      `[${i + 1}]`,
+      candidateNameOf(r),
+      r?.latestVersion ?? "-",
+      truncateDisplay(r?.description ?? "", 30),
+      r?.verification?.label ?? "未知",
+    ]);
+    ctx.log(
+      `为 "${spec}" 找到 ${ordered.length} 个候选${ordered.length > 10 ? "（显示前 10 个）" : ""}:`,
+    );
+    printTable(ctx, ["#", "名称", "版本", "描述", "验证等级"], rows);
+    if (!ctx.canPrompt) {
+      ctx.error("多个候选，请用完整名安装（或加 --yes 自动选择第 1 名）");
+      return 2;
+    }
+    const answer = String(await ctx.ask("输入编号安装（q 取消）: ") ?? "")
+      .trim()
+      .toLowerCase();
+    if (!answer || answer === "q") {
+      ctx.log("已取消");
+      return 0;
+    }
+    const index = Number.parseInt(answer, 10) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= shown.length) {
+      throw new Error("编号无效");
+    }
+    pick = shown[index];
+    ctx.log(`已选择：${candidateNameOf(pick)}（来自搜索）`);
+  }
+
+  // Derive the install target: a matching recipe wins (dependency closure
+  // is installed with it), otherwise the candidate's own install spec.
+  const pickName = candidateNameOf(pick) || candidateSpecOf(pick);
+  const pickRecipe = await probeRecipe(pickName);
+  if (pickRecipe) {
+    return {
+      target: transactionRecipe(pickRecipe),
+      name: pickRecipe.name,
+      recipe: pickRecipe,
+      recordSpec: pickName,
+    };
+  }
+  const pickSpec = candidateSpecOf(pick);
+  return { target: pickSpec, name: pickName, recipe: null, recordSpec: pickSpec };
+}
+
 // --- command handlers (each wraps its body; errors are Chinese) -------------
 
 async function cmdSearch(ctx, args, opts) {
   try {
     const query = args.join(" ").trim();
-    if (!query) throw new Error("用法: dshpkg search <关键词> [--online]");
+    if (!query) throw new Error("用法: dshpkg search <关键词> [--online] [--ecosystem]");
     const results = await search(query, {
       online: Boolean(opts.online),
+      ecosystemOnly: Boolean(opts.ecosystem),
       ...(opts.profile ? { profile: opts.profile } : {}),
       ...(ctx.fetcher ? { fetcher: ctx.fetcher } : {}),
     });
@@ -248,18 +443,35 @@ async function cmdInstall(ctx, args, opts) {
     const spec = String(args[0] ?? "").trim();
     if (!spec) {
       throw new Error(
-        "用法: dshpkg install <名称|npm名|git地址|本地路径>[@版本] [--dry-run] [--profile <名>]",
+        "用法: dshpkg install <名称|npm名|git地址|本地路径>[@版本] [--dry-run] [--profile <名>] [--yes]",
       );
     }
     const state = await readState();
     const profile = opts.profile ?? state.profile ?? "web";
-    const recipe = await probeRecipe(spec);
-    const target = recipe ? transactionRecipe(recipe) : spec;
+    let recipe = await probeRecipe(spec);
+    let target = recipe ? transactionRecipe(recipe) : spec;
+    let name = recipe?.name ?? displayNameOf(spec);
+    let recordSpec = spec; // what state.packages[].source records
+
+    // Smart resolution: a bare fuzzy word that is neither a recipe, a
+    // git/path spec, nor an unambiguous npm target goes through search —
+    // apt-style "type anything, get the package". Everything else keeps the
+    // historical direct-install path (backward compatibility).
+    if (!recipe && !isRemoteGitSpec(spec) && !isLocalPathSpec(spec) && !isDirectNpmSpec(spec)) {
+      const resolved = await resolveSmartInstall(ctx, spec, profile, opts);
+      if (typeof resolved === "number") return resolved;
+      target = resolved.target;
+      name = resolved.name;
+      recipe = resolved.recipe;
+      recordSpec = resolved.recordSpec;
+    }
+
     const result = await install(target, {
       profile,
       dryRun: Boolean(opts.dryRun),
       runner: ctx.runner,
       installRunner: ctx.installRunner ?? ctx.runner,
+      gitRunner: ctx.gitRunner ?? undefined,
     });
     if (!result.ok) throw new Error(result.error);
     if (opts.dryRun) {
@@ -267,15 +479,14 @@ async function cmdInstall(ctx, args, opts) {
       return 0;
     }
     // Bookkeeping: record every package this transaction installed.
-    const name = recipe?.name ?? displayNameOf(spec);
     for (const installedName of result.installed) {
       const existing = state.packages?.[installedName] ?? {};
       state.packages[installedName] = {
         ...existing,
-        source: existing.source ?? (installedName === name ? spec : installedName),
+        source: existing.source ?? (installedName === name ? recordSpec : installedName),
         version:
           installedName === name
-            ? versionOf(spec) ?? recipe?.source?.spec?.match(/@([^@/]+)$/)?.[1] ?? null
+            ? versionOf(recordSpec) ?? recipe?.source?.spec?.match(/@([^@/]+)$/)?.[1] ?? null
             : existing.version ?? null,
         kind: installedName === name ? recipe?.kind ?? "unknown" : existing.kind ?? "unknown",
         installedAt: new Date().toISOString(),
@@ -864,9 +1075,10 @@ export function helpText() {
     "用法: dshpkg <命令> [选项]",
     "",
     "命令:",
-    "  search <关键词>           搜索插件（本地索引；--online 联网 GitHub/npm）",
+    "  search <关键词>           搜索插件（本地索引；--online 联网 GitHub/npm，--ecosystem 仅 dsh 生态）",
     "  install <名称|npm名|git地址|本地路径>[@版本]",
-    "                            安装插件（--dry-run 演练，--profile <名>）",
+    "                            安装插件（名称支持模糊匹配；--dry-run 演练，",
+    "                            --yes 多候选时自动选第 1 名，--profile <名>）",
     "  remove <名称>             卸载插件（--dry-run 演练，--profile <名>）",
     "  update                    同步配方仓库并刷新插件索引（apt update 语义）",
     "  sync                      同 update",
@@ -891,8 +1103,10 @@ export function helpText() {
     "",
     "选项:",
     "  --online       search 时联网查询 GitHub/npm",
+    "  --ecosystem    search 时仅显示 dsh 生态插件（dsh* 包名或 dsh-plugin/deepseek 主题）",
     "  --installed    list 时仅显示已安装插件",
     "  --dry-run      只打印将执行的命令，不做任何修改",
+    "  --yes          install 多候选时跳过交互，自动选择第 1 名",
     "  --profile <名> 指定 profile（默认 state.json 记录的 profile，再默认 web）",
     "  --port <N>     run 与 host 探测端口（默认 3080）",
     "  -h, --help     显示本帮助",
@@ -901,8 +1115,10 @@ export function helpText() {
 
 const KNOWN_FLAGS = new Set([
   "--online",
+  "--ecosystem",
   "--installed",
   "--dry-run",
+  "--yes",
   "--profile",
   "--port",
   "--help",
@@ -920,11 +1136,13 @@ export function parseArgs(argv) {
     command: null,
     positionals: [],
     online: false,
+    ecosystem: false,
     installed: false,
     dryRun: false,
     profile: null,
     port: null,
     help: false,
+    yes: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -945,12 +1163,20 @@ export function parseArgs(argv) {
       opts.online = true;
       continue;
     }
+    if (arg === "--ecosystem") {
+      opts.ecosystem = true;
+      continue;
+    }
     if (arg === "--installed") {
       opts.installed = true;
       continue;
     }
     if (arg === "--dry-run") {
       opts.dryRun = true;
+      continue;
+    }
+    if (arg === "--yes") {
+      opts.yes = true;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {
@@ -1012,17 +1238,23 @@ export function defaultDshRun(args, deps = {}) {
  * every call); in production the add steps use the capturing install runner
  * so pnpm output (allowBuilds hints, network errors) can be inspected.
  */
-function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl } = {}) {
+function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner } = {}) {
   const resolvedRunner = runner ?? defaultRunner;
+  const askInjected = typeof ask === "function";
   return {
     log: log ?? ((...a) => console.log(...a)),
     error: error ?? ((...a) => console.error(...a)),
     ask: ask ?? defaultAsk,
+    // Interactive prompts only make sense on a TTY; an explicitly injected
+    // ask (tests / embedding hosts) always counts as interactive.
+    canPrompt: askInjected || process.stdin.isTTY === true,
     runner: resolvedRunner,
     installRunner: installRunner ?? (runner ? resolvedRunner : defaultInstallRunner),
     dshRun: dshRun ?? defaultDshRun,
     fetcher: fetcher ?? null,
     spawnImpl: spawnImpl ?? null,
+    search: search ?? null, // injectable search (smart install; tests)
+    gitRunner: gitRunner ?? null, // injectable git runner (search-derived github: specs)
   };
 }
 
@@ -1032,7 +1264,8 @@ function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spaw
  * try/catch is the final safety net.
  *
  * @param {string[]} argv args after "node bin/dshpkg.js"
- * @param {object} [io] injectable {log, error, ask, runner, dshRun, fetcher, spawnImpl}
+ * @param {object} [io] injectable {log, error, ask, runner, dshRun, fetcher,
+ *   spawnImpl, search, gitRunner}
  * @returns {Promise<number>} exit code
  */
 export async function runCli(argv, io = {}) {

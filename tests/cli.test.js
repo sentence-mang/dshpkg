@@ -357,6 +357,344 @@ test("install with --profile forwards the profile to dsh", async (t) => {
   assert.ok(calls.every((c) => c.includes("dev")));
 });
 
+// --------------------------------------------- smart install (fuzzy resolution)
+
+/** Fake search: records every call, returns per-call results from the script. */
+function fakeSearch(script = () => []) {
+  const calls = [];
+  const search = async (query, opts = {}) => {
+    calls.push({ query, opts });
+    return script(query, opts, calls.length);
+  };
+  return { calls, search };
+}
+
+/** A search-result-shaped candidate (module F result shape). */
+function searchItem(over = {}) {
+  return {
+    name: "dsh-at-file",
+    packageName: "dsh-at-file",
+    description: "余额文件管理插件",
+    latestVersion: "1.2.0",
+    verification: { level: "auto", label: "自动验证" },
+    security: { riskLevel: "low" },
+    score: 95,
+    ...over,
+  };
+}
+
+/** Force stdin to look non-interactive for one test (restored afterwards). */
+function forceNonTty(t) {
+  const prev = process.stdin.isTTY;
+  process.stdin.isTTY = false;
+  t.after(() => {
+    if (prev === undefined) delete process.stdin.isTTY;
+    else process.stdin.isTTY = prev;
+  });
+}
+
+test("parseArgs accepts --yes before or after the command", () => {
+  assert.equal(parseArgs(["install", "foo", "--yes"]).yes, true);
+  assert.equal(parseArgs(["--yes", "install", "foo"]).yes, true);
+  assert.equal(parseArgs(["install", "foo"]).yes, false);
+});
+
+test("install a fuzzy word with a single strong match installs it directly", async (t) => {
+  await makeEnv(t);
+  const { calls, search } = fakeSearch(() => [searchItem()]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "at-file"], io);
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].query, "at-file");
+  assert.equal(calls[0].opts.online, false);
+  assert.equal(calls[0].opts.ecosystemOnly, true); // duck-typed hint to search.js
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.deepEqual(add, ["plugin", "--profile", "web", "add", "dsh-at-file"]);
+  assert.ok(logs.join("\n").includes("已匹配：dsh-at-file（来自搜索）"));
+  const state = await readState();
+  assert.equal(state.packages["dsh-at-file"].source, "dsh-at-file");
+  assert.equal(state.packages["dsh-at-file"].version, null);
+});
+
+test("install an exact-name hit inside the search chain wins over score", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "at-file", packageName: "", score: 100 }),
+    searchItem({ score: 90 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "at-file"], io);
+  assert.equal(code, 0);
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.equal(add[4], "at-file"); // packageName empty -> derived from the name
+  assert.ok(logs.join("\n").includes("已匹配：at-file（来自搜索）"));
+});
+
+test("install auto-picks a lone ecosystem candidate 30+ points ahead", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 100 }),
+    searchItem({ name: "other-tool", packageName: "other-tool", score: 50 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "balance"], io);
+  assert.equal(code, 0);
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.equal(add[4], "dsh-balance");
+  assert.ok(logs.join("\n").includes("已匹配：dsh-balance（来自搜索）"));
+});
+
+test("install lists candidates when the ecosystem leader is not 30 points ahead", async (t) => {
+  await makeEnv(t);
+  forceNonTty(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 90 }),
+    searchItem({ name: "other-tool", packageName: "other-tool", score: 80 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs, errors } = captureIo({ runner, search });
+  const code = await runCli(["install", "balance"], io);
+  assert.equal(code, 2);
+  assert.equal(runCalls.length, 0);
+  const text = logs.join("\n");
+  assert.ok(text.includes("dsh-balance"));
+  assert.ok(text.includes("other-tool"));
+  assert.ok(errors.join("\n").includes("多个候选，请用完整名安装"));
+});
+
+test("install with multiple candidates and no TTY lists them and exits 2", async (t) => {
+  await makeEnv(t);
+  forceNonTty(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", description: "余额查询", score: 90 }),
+    searchItem({ name: "dsh-balance-plus", packageName: "dsh-balance-plus", score: 60 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs, errors } = captureIo({ runner, search });
+  const code = await runCli(["install", "余额"], io);
+  assert.equal(code, 2);
+  assert.equal(runCalls.length, 0); // nothing installed without a choice
+  const text = logs.join("\n");
+  assert.ok(text.includes("为 \"余额\" 找到 2 个候选"));
+  assert.ok(text.includes("dsh-balance"));
+  assert.ok(text.includes("dsh-balance-plus"));
+  assert.ok(text.includes("余额查询")); // description column
+  assert.ok(text.includes("自动验证")); // verification column
+  assert.ok(errors.join("\n").includes("多个候选，请用完整名安装"));
+  const state = await readState();
+  assert.equal(Object.keys(state.packages ?? {}).length, 0);
+});
+
+test("install shows at most 10 candidates in the list", async (t) => {
+  await makeEnv(t);
+  forceNonTty(t);
+  const items = Array.from({ length: 12 }, (_, i) =>
+    searchItem({ name: `dsh-balance-${i + 1}`, packageName: `dsh-balance-${i + 1}`, score: 100 - i }));
+  const { search } = fakeSearch(() => items);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "balance"], io);
+  assert.equal(code, 2);
+  assert.equal(runCalls.length, 0);
+  const text = logs.join("\n");
+  assert.ok(text.includes("显示前 10 个"));
+  assert.ok(text.includes("[10]"));
+  assert.ok(!text.includes("[11]"));
+});
+
+test("install with zero candidates prints the refresh hint and exits 1", async (t) => {
+  await makeEnv(t);
+  const { calls, search } = fakeSearch(() => []);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, errors } = captureIo({ runner, search });
+  const code = await runCli(["install", "不存在的东西"], io);
+  assert.equal(code, 1);
+  assert.equal(runCalls.length, 0);
+  const text = errors.join("\n");
+  assert.ok(text.includes("未找到"));
+  assert.ok(text.includes("dshpkg search"));
+  assert.ok(text.includes("dshpkg update"));
+  // empty local index -> exactly one automatic online retry
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].opts.online, false);
+  assert.equal(calls[1].opts.online, true);
+});
+
+test("install does not retry online when the local index is not empty", async (t) => {
+  await makeEnv(t);
+  await writeJsonAtomic(statePath("index", "items.json"), [
+    searchItem({ name: "dsh-unrelated", packageName: "dsh-unrelated" }),
+  ]);
+  const { calls, search } = fakeSearch(() => []);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, errors } = captureIo({ runner, search });
+  const code = await runCli(["install", "不存在的东西"], io);
+  assert.equal(code, 1);
+  assert.equal(runCalls.length, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.online, false);
+  assert.ok(errors.join("\n").includes("未找到"));
+});
+
+test("install retries online once when the local index is empty and hits", async (t) => {
+  await makeEnv(t);
+  const { calls, search } = fakeSearch((_q, opts) => (opts.online ? [searchItem()] : []));
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "at-file"], io);
+  assert.equal(code, 0);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].opts.online, false);
+  assert.equal(calls[1].opts.online, true);
+  assert.equal(calls[1].opts.ecosystemOnly, undefined); // online pass stays broad
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.equal(add[4], "dsh-at-file");
+  assert.ok(logs.join("\n").includes("已匹配：dsh-at-file（来自搜索）"));
+});
+
+test("install --yes picks the first candidate without prompting", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 90 }),
+    searchItem({ name: "dsh-balance-plus", packageName: "dsh-balance-plus", score: 60 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "余额", "--yes"], io);
+  assert.equal(code, 0);
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.equal(add[4], "dsh-balance");
+  const text = logs.join("\n");
+  assert.ok(text.includes("已匹配：dsh-balance（来自搜索，--yes 自动选择第 1 名）"));
+  const state = await readState();
+  assert.ok(state.packages["dsh-balance"]);
+});
+
+test("install interactive pick installs the chosen candidate", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 90 }),
+    searchItem({ name: "dsh-balance-plus", packageName: "dsh-balance-plus", score: 60 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const asked = [];
+  const { io, logs } = captureIo({
+    runner,
+    search,
+    ask: async (prompt) => {
+      asked.push(prompt);
+      return "2";
+    },
+  });
+  const code = await runCli(["install", "余额"], io);
+  assert.equal(code, 0);
+  assert.equal(asked.length, 1);
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.equal(add[4], "dsh-balance-plus");
+  assert.ok(logs.join("\n").includes("已选择：dsh-balance-plus（来自搜索）"));
+});
+
+test("install interactive pick cancels on q", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 90 }),
+    searchItem({ name: "dsh-balance-plus", packageName: "dsh-balance-plus", score: 60 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search, ask: async () => "q" });
+  const code = await runCli(["install", "余额"], io);
+  assert.equal(code, 0);
+  assert.equal(runCalls.length, 0);
+  assert.ok(logs.join("\n").includes("已取消"));
+  const state = await readState();
+  assert.equal(Object.keys(state.packages ?? {}).length, 0);
+});
+
+test("install interactive pick rejects an out-of-range number", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-balance", packageName: "dsh-balance", score: 90 }),
+    searchItem({ name: "dsh-balance-plus", packageName: "dsh-balance-plus", score: 60 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, errors } = captureIo({ runner, search, ask: async () => "99" });
+  const code = await runCli(["install", "余额"], io);
+  assert.equal(code, 1);
+  assert.equal(runCalls.length, 0);
+  assert.ok(errors.join("\n").includes("编号无效"));
+});
+
+test("install of an exact npm name never enters the search chain", async (t) => {
+  await makeEnv(t);
+  const { calls, search } = fakeSearch(() => {
+    throw new Error("search must not run for direct specs");
+  });
+  for (const [spec, added] of [
+    ["dsh-plugin-x", "dsh-plugin-x"], // ecosystem bare name
+    ["some-pkg@1.2.3", "some-pkg@1.2.3"], // version pin
+    ["npm:other-pkg", "npm:other-pkg"], // explicit npm: prefix
+  ]) {
+    const { calls: runCalls, runner } = fakeRunner();
+    const { io, logs } = captureIo({ runner, search });
+    const code = await runCli(["install", spec], io);
+    assert.equal(code, 0);
+    assert.equal(calls.length, 0); // search chain bypassed
+    const add = runCalls.find((c) => c[0] === "plugin");
+    assert.equal(add[4], added);
+    assert.ok(logs.join("\n").includes("已安装")); // original direct-install flow
+  }
+});
+
+test("install resolves a search hit through the recipe repo (dependency closure)", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    "dsh-at-file": recipeOf("dsh-at-file", "dsh-at-file@1.0.0", { deps: ["dsh-lib"] }),
+    "dsh-lib": recipeOf("dsh-lib", "dsh-lib@0.5.0"),
+  });
+  const { search } = fakeSearch(() => [searchItem()]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, search });
+  const code = await runCli(["install", "at-file"], io);
+  assert.equal(code, 0);
+  const adds = runCalls.filter((c) => c[0] === "plugin");
+  assert.equal(adds.length, 2);
+  assert.equal(adds[0][4], "dsh-lib"); // string deps install by name, deps first
+  assert.equal(adds[1][4], "dsh-at-file@1.0.0");
+  const state = await readState();
+  assert.ok(state.packages["dsh-at-file"]);
+  assert.ok(state.packages["dsh-lib"]);
+  assert.equal(state.packages["dsh-at-file"].version, "1.0.0"); // from the recipe spec
+  assert.ok(logs.join("\n").includes("已匹配：dsh-at-file（来自搜索）"));
+});
+
+test("install derives a github: spec for a GitHub-only search hit", async (t) => {
+  await makeEnv(t);
+  const { search } = fakeSearch(() => [
+    searchItem({ name: "dsh-tools", packageName: "", ownerRepo: "alice/dsh-tools", score: 100 }),
+  ]);
+  const { calls: runCalls, runner } = fakeRunner();
+  const gitCalls = [];
+  const gitRunner = (args) => {
+    gitCalls.push([...args]);
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const { io, logs } = captureIo({ runner, search, gitRunner });
+  const code = await runCli(["install", "tools"], io);
+  assert.equal(code, 0);
+  assert.equal(gitCalls.length, 1); // clone into the git cache
+  assert.equal(gitCalls[0][0], "clone");
+  const add = runCalls.find((c) => c[0] === "plugin");
+  assert.ok(add[4].startsWith("link:")); // installed from the cache via link:
+  assert.ok(add[4].includes("github.com-alice-dsh-tools"));
+  assert.ok(logs.join("\n").includes("已匹配：dsh-tools（来自搜索）"));
+  const state = await readState();
+  assert.equal(state.packages["dsh-tools"].source, "github:alice/dsh-tools");
+});
+
 // ------------------------------------------------------------------- remove
 
 test("remove uninstalls and deletes bookkeeping", async (t) => {
