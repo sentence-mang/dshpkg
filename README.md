@@ -61,6 +61,44 @@ dshpkg search <关键词> # 搜索插件
 dshpkg install <名称>  # 事务安装
 ```
 
+## AUR 式源码安装
+
+除配方名外，`install` 直接接受 **git 源**——像 AUR 一样直接从源码仓库安装：
+
+| 语法 | 说明 |
+| --- | --- |
+| `github:owner/repo` | GitHub 仓库简写 |
+| `git+https://github.com/owner/repo.git` | 完整 git URL（任意 git 主机均可） |
+| `github:owner/repo#path:packages/sub` | monorepo 子包目录 |
+
+```powershell
+dshpkg install github:owner/repo
+dshpkg install git+https://github.com/owner/repo.git
+dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
+```
+
+**构建**：默认走包自带的 `prepare` 脚本；配方可声明 `build.commands` 自定义构建命令：
+
+```json
+{
+  "name": "example-plugin",
+  "source": "github:owner/repo",
+  "build": {
+    "commands": ["pnpm install", "pnpm run build"]
+  }
+}
+```
+
+**git 缓存**：源码缓存于 `~/.dsh/dshpkg/cache/git/<name>/`，二次安装走 `git fetch` 快速路径，只拉增量提交。
+
+**allowBuilds 自动处理**：pnpm 默认拦截依赖包的构建脚本；检测到构建被拦时，dshpkg 自动把包名写入 profile 的 `pnpm-workspace.yaml`（`onlyBuiltDependencies`）并重试一次，无需手动 `pnpm approve-builds`。
+
+**网络提示**：GitHub HTTPS 不通时，一行命令全局切 SSH：
+
+```powershell
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+```
+
 ## CLI 命令（21 个）
 
 | 命令 | 说明 |
