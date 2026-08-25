@@ -202,6 +202,15 @@ test("isGitNetworkError recognizes GitHub connection failures", () => {
   assert.equal(isGitNetworkError(null), false);
 });
 
+test("isGitNetworkError recognizes pnpm's git resolution error code", () => {
+  assert.equal(
+    isGitNetworkError("ERR_PNPM_GIT_RESOLVE_FAILED Failed to resolve git head from repo"),
+    true,
+  );
+  assert.equal(isGitNetworkError("err_pnpm_git_resolve_failed (lowercase output)"), true);
+  assert.equal(isGitNetworkError("ERR_PNPM_BUILD_SCRIPTS_NOT_ALLOWED"), false);
+});
+
 test("SSH_HINT carries the git insteadOf switching command", () => {
   assert.ok(SSH_HINT.includes("git config --global"));
   assert.ok(SSH_HINT.includes("git@github.com:"));

@@ -101,7 +101,7 @@ test("git specs are cloned into the cache and installed via link:", async (t) =>
     gitRunner: git.run,
   });
 
-  assert.deepEqual(res, { ok: true, installed: ["dsh-plugin-src"] });
+  assert.deepEqual(res, { ok: true, installed: ["dsh-plugin-src"], usedCache: true });
 
   // the clone ran once, with --depth 1
   const cacheDir = join(process.env.DSH_PKG_HOME, "cache", "git", "github.com-owner-repo");
@@ -199,7 +199,9 @@ test("git specs in dryRun print the plan and invoke no runner", async (t) => {
     gitRunner: git.run,
   });
   console.log = orig;
-  assert.deepEqual(res, { ok: true, installed: ["dsh-plugin-src"] });
+  // dryRun pulls nothing, so the name falls back to the repo basename and
+  // the plan assumes the cache path (usedCache: true).
+  assert.deepEqual(res, { ok: true, installed: ["repo"], usedCache: true });
   assert.equal(dsh.calls.length, 0);
   assert.equal(git.calls.length, 0);
   assert.ok(logs.some((l) => l.includes("git 缓存")));
@@ -473,15 +475,35 @@ test("a GitHub connection failure during add reports the SSH switching hint", as
   assert.match(res.error, /insteadOf/);
 });
 
-test("a failed clone with a connection error reports the SSH hint too", async (t) => {
+test("a failed cache pull falls back to the official channel (usedCache: false)", async (t) => {
   await makeEnv(t);
   const dsh = fakeDsh();
+  const git = fakeGit({ failWith: "fatal: not a git repository" }); // non-network failure
+  const res = await install("github:owner/repo", { runner: dsh.runner, gitRunner: git.run });
+  assert.equal(res.ok, true);
+  assert.equal(res.usedCache, false);
+  assert.deepEqual(res.installed, ["repo"]); // repo-name fallback (no manifest pulled)
+  // the add step got the ORIGINAL spec, not a link: path
+  assert.equal(dsh.calls.find((c) => c[0] === "plugin" && c[3] === "add")[4], "github:owner/repo");
+});
+
+test("a failed clone falls back to pnpm; a network failure there reports the SSH hint", async (t) => {
+  await makeEnv(t);
+  const dsh = fakeDsh((args) => {
+    if (args[0] === "plugin" && args[3] === "add") {
+      return {
+        status: 1,
+        stderr: "ERR_PNPM_GIT_RESOLVE_FAILED Failed to connect to github.com port 443",
+      };
+    }
+    return 0;
+  });
   const git = fakeGit({ failWith: "fatal: Failed to connect to github.com port 443" });
   const res = await install("github:owner/repo", { runner: dsh.runner, gitRunner: git.run });
   assert.equal(res.ok, false);
-  assert.match(res.error, /git 仓库拉取失败/);
   assert.match(res.error, /网络无法直连 GitHub/);
   assert.match(res.error, /insteadOf/);
-  assert.equal(res.rolledBack, false);
-  assert.equal(dsh.calls.filter((c) => c[0] === "plugin").length, 0);
+  // fell back: the add step got the ORIGINAL spec, not a link: path
+  assert.equal(dsh.calls.find((c) => c[0] === "plugin" && c[3] === "add")[4], "github:owner/repo");
+  assert.equal(res.rolledBack, true); // nothing was installed before the failure
 });

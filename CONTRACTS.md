@@ -306,3 +306,46 @@ state/managed path stays intact. Upstream follow-ups:
   enable/disable/add/remove), so enable/disable persistence has exactly one
   official path: the patch layer (cordis.patch.yml). If upstream extends the
   inventory with mutation APIs, dshpkg should migrate to them.
+
+### R11. Source installs: recipe build field, git cache, allowBuilds (feat/aur-wip)
+
+- **build field semantics.** RECIPE_SCHEMA gains an optional
+  `build: { commands: string[], cwd?: string }`. Commands run sequentially
+  AFTER a successful install, INSIDE the installed package directory —
+  resolved through `fs.realpath(<profile>/node_modules/<name>)` so pnpm
+  junctions point at the real source — with a relative `build.cwd` joined on
+  top. Every command spawns with `shell: false` and whitespace tokenization
+  (first token = executable; NO quoting/pipes — deliberate, recipes must
+  stay simple and shell-injection-free); the executor is injectable
+  (`opts.execBuild`, default `spawnSync`) so tests never run a real build.
+  Any failing command rolls the whole transaction back with a Chinese error.
+- **git cache path convention.** Git-backed specs (`github:owner/repo`,
+  `git+https://…`, `git@…`, `….git`) cache under
+  `<stateRoot>/cache/git/<sanitized-url>/` (scheme stripped, unsafe chars to
+  `-`): `clone --depth 1` on first use, `fetch --depth 1` + `reset --hard
+  origin/HEAD` after. The install is a `link:` to the cache dir (or to the
+  `#path:subdir` fragment's subdirectory; a MISSING subdir aborts — pnpm
+  would not understand the fragment). Non-`path:` fragments (#branch/#tag/
+  #commit) bypass the cache and go to pnpm unchanged (pnpm resolves refs
+  natively).
+- **The real name rule.** A `link:` install registers the pulled manifest's
+  name with pnpm, so rollback and bookkeeping must use THAT name when
+  readable (`<target>/package.json`.name). Otherwise the recipe's declared
+  name stays authoritative; only a url-shaped pkgNameOf leftover (contains
+  `:`, e.g. "github:owner") is replaced by the repo url basename. dryRun
+  pulls nothing and keeps the declared/derived name.
+- **Cache failure falls back.** A failed cache pull (no git, network,
+  corrupted cache, …) does NOT abort: the ORIGINAL spec goes to the official
+  pnpm channel and the result carries `usedCache: false` (`true` when the
+  cache was used; the field is absent when no git spec was involved).
+- **allowBuilds auto-handling.** pnpm's allowBuilds rejection (output naming
+  BOTH "allowBuilds" and "pnpm-workspace.yaml", captured by a piped install
+  runner) is auto-handled: extract keys (inline list / YAML block /
+  package-name-looking tokens — hyphen, slash or @ required, file names and
+  ERR_PNPM codes rejected), merge them into `<profile>/pnpm-workspace.yaml`
+  deduplicated (existing keys, comments and unrelated lines preserved; block
+  form appends after the last list item), then retry the add ONCE.
+- **SSH hint.** Git/network failures (Failed to connect to github.com /
+  Could not connect / ERR_PNPM_GIT_RESOLVE_FAILED / could not resolve host /
+  …) surface a Chinese error with the SSH `insteadOf` switching hint
+  (`git config --global url."git@github.com:".insteadOf "https://github.com/"`).

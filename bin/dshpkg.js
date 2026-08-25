@@ -80,8 +80,8 @@ function versionOf(spec) {
 /** Human name for state bookkeeping, handling npm/git/path specs. */
 function displayNameOf(spec) {
   const s = String(spec).trim().replace(/^(link:|file:)/, "");
-  if (/^(https?:\/\/|git@|git\+|ssh:)/.test(s)) {
-    const tail = s.replace(/\.git$/, "").replace(/[\\/]+$/, "").match(/[^/:\\]+$/);
+  if (/^(https?:\/\/|git@|git\+|ssh:|github:)/i.test(s)) {
+    const tail = s.replace(/\.git$/, "").replace(/[\\/]+$/, "").match(/[^\/:\\]+$/);
     return tail ? tail[0] : s;
   }
   if (
@@ -175,7 +175,7 @@ async function hostPost(ctx, port, path, body) {
 async function probeRecipe(spec) {
   const s = String(spec).trim();
   if (!s) return null;
-  if (/^(https?:\/\/|git@|git\+|ssh:)/.test(s) || /\.git(?:[#@/]|$)/.test(s)) {
+  if (/^(https?:\/\/|git@|git\+|ssh:|github:)/i.test(s) || /\.git(?:[#@/]|$)/.test(s)) {
     return null; // remote git spec — pnpm handles it, no probe needed
   }
   const localPath = s.replace(/^(link:|file:)/, "");
