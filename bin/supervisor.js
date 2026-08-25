@@ -17,16 +17,16 @@
 //   - all IO is injectable (spawnImpl / probeImpl / sleepImpl / onEvent) so
 //     the test suite stays fully offline.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { copyFile, readFile, realpath, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { listSnapshots, resolveProfileDir, statePath, readJson } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
+import { resolveDshLauncher } from "../lib/launcher.js";
 
 // --- tuning constants (exported for tests / documentation) -----------------
 
@@ -523,49 +523,14 @@ export async function removeManagedBlock(profileDir) {
  *   DSH_LAUNCHER env, else <npm-global>/node_modules/@deepseek-ai/dsh/lib/bin.js
  * (npm prefix -g when npm is available, then well-known prefixes without
  * invoking any process). Returns null when not found.
+ *
+ * The watchdog always launches via `node <script>` — a DSH_BIN .exe is not a
+ * JS entry point and is ignored here (allowDirect: false), matching the
+ * original supervisor behavior.
  */
 function resolveLauncherBin() {
-  if (process.env.DSH_LAUNCHER) return process.env.DSH_LAUNCHER;
-  try {
-    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-    const result = spawnSync(npmCmd, ["prefix", "-g"], {
-      encoding: "utf8",
-      timeout: 5_000,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    if (result.status === 0 && result.stdout) {
-      const candidate = join(
-        result.stdout.trim(),
-        "node_modules",
-        "@deepseek-ai",
-        "dsh",
-        "lib",
-        "bin.js",
-      );
-      if (existsSync(candidate)) return candidate;
-    }
-  } catch {
-    // npm not available — fall through to static prefixes.
-  }
-  const prefixes = [];
-  if (process.platform === "win32") {
-    if (process.env.APPDATA) prefixes.push(join(process.env.APPDATA, "npm"));
-  } else {
-    prefixes.push("/usr/local", "/usr", join(homedir(), ".local"));
-  }
-  for (const prefix of prefixes) {
-    const candidate = join(
-      prefix,
-      "node_modules",
-      "@deepseek-ai",
-      "dsh",
-      "lib",
-      "bin.js",
-    );
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
+  const resolved = resolveDshLauncher({ allowDirect: false });
+  return resolved ? resolved.script : null;
 }
 
 /**

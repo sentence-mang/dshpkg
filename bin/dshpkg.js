@@ -12,7 +12,7 @@
 //   - comments in English, user-facing output in Chinese;
 //   - log/error/ask/runner/fetcher are injectable so tests stay offline.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -38,6 +38,7 @@ import { refreshIndex } from "../lib/indexer.js";
 import { install, remove, defaultRunner } from "../lib/transaction.js";
 import { isOpen, closeCircuit } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
+import { runDshSync } from "../lib/launcher.js";
 import {
   hasManagedBlock,
   applyDisableToPatch,
@@ -989,10 +990,16 @@ async function defaultAsk(prompt) {
   }
 }
 
-/** Default dsh runner for doctor: spawnSync, no shell, output captured. */
-export function defaultDshRun(args) {
-  const bin = process.env.DSH_BIN || "dsh";
-  return spawnSync(bin, args, { env: process.env, encoding: "utf8", shell: false });
+/**
+ * Default dsh run for doctor: shared launcher resolution (DSH_BIN .exe
+ * direct, else `node <bin.js>`), spawnSync, never through a shell, output
+ * captured for the doctor report. Dependencies are injectable for tests.
+ *
+ * @param {string[]} args dsh arguments (without the binary itself)
+ * @param {object} [deps] {spawnImpl, resolveImpl, execPath}
+ */
+export function defaultDshRun(args, deps = {}) {
+  return runDshSync(args, { options: { encoding: "utf8" }, ...deps });
 }
 
 /** Build the injectable context from user overrides (tests inject fakes). */

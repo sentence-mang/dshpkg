@@ -10,7 +10,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runCli, parseArgs, helpText, HOST_PORT } from "../bin/dshpkg.js";
+import { runCli, parseArgs, helpText, HOST_PORT, defaultDshRun } from "../bin/dshpkg.js";
 import { readState, writeState, statePath, writeJsonAtomic } from "../lib/state.js";
 
 // ------------------------------------------------------------- test plumbing
@@ -848,6 +848,31 @@ test("host probe respects --port when choosing the HTTP target", async (t) => {
   await runCli(["status", "x", "--port", "9999"], io);
   assert.ok(seen.every((u) => u.includes("9999")));
   assert.ok(!seen.some((u) => u.includes(String(HOST_PORT))));
+});
+
+// -------------------------------------------------------- dsh launcher
+
+test("defaultDshRun spawns node with the resolved launcher script", (t) => {
+  // The real dsh binary on Windows is a .cmd shim; the CLI must route
+  // through `node <launcherBin>` instead of spawning "dsh" directly.
+  const fakeLauncher = join(tmpdir(), "dshpkg-fake-launcher-bin.js");
+  process.env.DSH_LAUNCHER = fakeLauncher;
+  delete process.env.DSH_BIN;
+  t.after(() => {
+    delete process.env.DSH_LAUNCHER;
+  });
+  const calls = [];
+  const spawnImpl = (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const result = defaultDshRun(["--version"], { spawnImpl });
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, process.execPath);
+  assert.deepEqual(calls[0].args, [fakeLauncher, "--version"]);
+  assert.equal(calls[0].options.encoding, "utf8");
+  assert.equal(calls[0].options.shell, undefined); // never shell:true
 });
 
 test("helpText lists every documented command", () => {

@@ -8,7 +8,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveDeps, install, remove, autoremove } from "../lib/transaction.js";
+import {
+  resolveDeps,
+  install,
+  remove,
+  autoremove,
+  defaultRunner,
+} from "../lib/transaction.js";
+import { resolveDshLauncher, LAUNCHER_SEGMENTS } from "../lib/launcher.js";
 
 /** Fake runner: records args, returns {status} from the given script. */
 function fakeRunner(script = () => 0) {
@@ -18,6 +25,27 @@ function fakeRunner(script = () => 0) {
     return { status: script(args) };
   };
   return { calls, runner };
+}
+
+/** Point the given env vars at values for one test, then restore them. */
+function useEnv(t, vars) {
+  const prev = new Map();
+  for (const [key, value] of Object.entries(vars)) {
+    prev.set(
+      key,
+      Object.prototype.hasOwnProperty.call(process.env, key)
+        ? process.env[key]
+        : undefined,
+    );
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  t.after(() => {
+    for (const [key, value] of prev) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
 }
 
 /**
@@ -315,4 +343,151 @@ test("autoremove fails when the profile is missing", async (t) => {
   assert.equal(res.ok, false);
   assert.match(res.error, /profile/);
   assert.equal(calls.length, 0);
+});
+
+// --------------------------------------------- default runner shape (dsh launcher)
+
+// The npm-installed "dsh" on Windows is a .cmd/.ps1 shim without an .exe;
+// CreateProcess (shell:false) cannot run it (ENOENT/EINVAL). The default
+// runner must therefore invoke `node <launcherBin>` — verified here via an
+// injected spawnImpl (a real dsh/node process is never executed).
+
+const LAUNCHER_TAIL = join(...LAUNCHER_SEGMENTS);
+
+test("defaultRunner: DSH_LAUNCHER runs the node + launcherBin form", (t) => {
+  const script = "C:/fake/dsh-lib-bin.js";
+  useEnv(t, { DSH_BIN: undefined, DSH_LAUNCHER: script });
+  const calls = [];
+  const spawnImpl = (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { status: 0 };
+  };
+  const res = defaultRunner(["plugin", "--profile", "web", "remove", "x"], {
+    spawnImpl,
+  });
+  assert.equal(res.status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, process.execPath);
+  assert.deepEqual(calls[0].args, [
+    script,
+    "plugin",
+    "--profile",
+    "web",
+    "remove",
+    "x",
+  ]);
+  // shell is never enabled; the environment is inherited
+  assert.deepEqual(calls[0].options, { env: process.env, stdio: "inherit" });
+});
+
+test("defaultRunner: a .exe DSH_BIN is spawned directly", (t) => {
+  useEnv(t, { DSH_BIN: "dsh.exe", DSH_LAUNCHER: undefined });
+  const calls = [];
+  const spawnImpl = (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { status: 0 };
+  };
+  const res = defaultRunner(["--profile", "web", "--dump-config"], {
+    spawnImpl,
+  });
+  assert.equal(res.status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, "dsh.exe");
+  assert.deepEqual(calls[0].args, ["--profile", "web", "--dump-config"]);
+  assert.deepEqual(calls[0].options, { env: process.env, stdio: "inherit" });
+});
+
+test("defaultRunner: a .cmd DSH_BIN shim is skipped in favor of DSH_LAUNCHER", (t) => {
+  const script = "C:/fake/dsh-lib-bin.js";
+  useEnv(t, { DSH_BIN: "dsh.cmd", DSH_LAUNCHER: script });
+  const calls = [];
+  const spawnImpl = (cmd, args) => {
+    calls.push({ cmd, args });
+    return { status: 0 };
+  };
+  const res = defaultRunner(["--profile", "web"], { spawnImpl });
+  assert.equal(res.status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, process.execPath);
+  assert.deepEqual(calls[0].args, [script, "--profile", "web"]);
+});
+
+test("defaultRunner: an unresolvable launcher errors without spawning", (t) => {
+  useEnv(t, { DSH_BIN: undefined, DSH_LAUNCHER: undefined });
+  let spawned = 0;
+  const spawnImpl = () => {
+    spawned += 1;
+    return { status: 0 };
+  };
+  const res = defaultRunner(["--profile", "web"], {
+    spawnImpl,
+    resolveImpl: () => null,
+  });
+  assert.equal(res.status, null);
+  assert.ok(res.error instanceof Error);
+  assert.match(res.error.message, /未找到 dsh 全局入口/);
+  assert.equal(spawned, 0);
+});
+
+// ------------------------------------ resolveDshLauncher resolution priority
+
+test("resolveDshLauncher: DSH_BIN .exe wins over DSH_LAUNCHER", (t) => {
+  useEnv(t, { DSH_BIN: "dsh.exe", DSH_LAUNCHER: "C:/fake/bin.js" });
+  assert.deepEqual(resolveDshLauncher(), { kind: "direct", command: "dsh.exe" });
+});
+
+test("resolveDshLauncher: a path DSH_BIN .exe must exist, else it falls through", (t) => {
+  useEnv(t, { DSH_BIN: "C:/missing/dsh.exe", DSH_LAUNCHER: "C:/fake/bin.js" });
+  assert.deepEqual(resolveDshLauncher(), { kind: "node", script: "C:/fake/bin.js" });
+});
+
+test("resolveDshLauncher: a .cmd shim DSH_BIN is not directly spawnable", (t) => {
+  useEnv(t, { DSH_BIN: "dsh.cmd", DSH_LAUNCHER: "C:/fake/bin.js" });
+  assert.deepEqual(resolveDshLauncher(), { kind: "node", script: "C:/fake/bin.js" });
+});
+
+test("resolveDshLauncher: a .ps1 shim DSH_BIN is not directly spawnable", (t) => {
+  useEnv(t, { DSH_BIN: "dsh.ps1", DSH_LAUNCHER: "C:/fake/bin.js" });
+  assert.deepEqual(resolveDshLauncher(), { kind: "node", script: "C:/fake/bin.js" });
+});
+
+test("resolveDshLauncher: npm prefix -g auto-detects the launcher script", (t) => {
+  useEnv(t, { DSH_BIN: undefined, DSH_LAUNCHER: undefined });
+  const prefix = "C:/fake/npm-global";
+  const expected = join(prefix, ...LAUNCHER_SEGMENTS);
+  const spawnImpl = () => ({ status: 0, stdout: `${prefix}\n` });
+  const existsImpl = (p) => p === expected;
+  assert.deepEqual(resolveDshLauncher({ spawnImpl, existsImpl }), {
+    kind: "node",
+    script: expected,
+  });
+});
+
+test("resolveDshLauncher: static prefixes are probed when npm fails", (t) => {
+  useEnv(t, { DSH_BIN: undefined, DSH_LAUNCHER: undefined });
+  const probed = [];
+  const spawnImpl = () => ({ status: 1, stdout: "" });
+  const existsImpl = (p) => {
+    probed.push(p);
+    return true;
+  };
+  const resolved = resolveDshLauncher({ spawnImpl, existsImpl });
+  assert.equal(resolved.kind, "node");
+  assert.equal(resolved.script, probed[0]);
+  assert.ok(resolved.script.endsWith(LAUNCHER_TAIL));
+});
+
+test("resolveDshLauncher: returns null when nothing resolves", (t) => {
+  useEnv(t, { DSH_BIN: undefined, DSH_LAUNCHER: undefined });
+  const spawnImpl = () => ({ status: 1, stdout: "" });
+  const existsImpl = () => false;
+  assert.equal(resolveDshLauncher({ spawnImpl, existsImpl }), null);
+});
+
+test("resolveDshLauncher: allowDirect false ignores a DSH_BIN .exe (supervisor)", (t) => {
+  useEnv(t, { DSH_BIN: "dsh.exe", DSH_LAUNCHER: "C:/fake/bin.js" });
+  assert.deepEqual(resolveDshLauncher({ allowDirect: false }), {
+    kind: "node",
+    script: "C:/fake/bin.js",
+  });
 });
