@@ -156,6 +156,56 @@ test("validateRecipe accumulates multiple errors", () => {
   assert.ok(result.errors.length >= 3, JSON.stringify(result.errors));
 });
 
+// ---------- build field (AUR-style build()/package() equivalent) ----------
+
+test("validateRecipe accepts a build block with commands and cwd", () => {
+  const result = validateRecipe({
+    name: "x",
+    build: { commands: ["npm run build", "node ./scripts/post.js"], cwd: "packages/core" },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.build, {
+    commands: ["npm run build", "node ./scripts/post.js"],
+    cwd: "packages/core",
+  });
+});
+
+test("validateRecipe accepts a build block without cwd", () => {
+  const result = validateRecipe({ name: "x", build: { commands: ["make"] } });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.build, { commands: ["make"] });
+});
+
+test("validateRecipe leaves the build field undefined when omitted (backwards compatible)", () => {
+  const result = validateRecipe({ name: "x" });
+  assert.equal(result.ok, true);
+  assert.equal(result.value.build, undefined);
+});
+
+test("validateRecipe rejects a non-object build block", () => {
+  for (const bad of ["make", 42, ["make"], true]) {
+    const result = validateRecipe({ name: "x", build: bad });
+    assert.equal(result.ok, false, String(bad));
+    assert.ok(result.errors.some((e) => e.includes("build")), JSON.stringify(result.errors));
+  }
+});
+
+test("validateRecipe rejects build.commands that is not a string array", () => {
+  const noCommands = validateRecipe({ name: "x", build: {} });
+  assert.equal(noCommands.ok, false);
+  assert.ok(noCommands.errors.some((e) => e.includes("build.commands")));
+
+  const badItems = validateRecipe({ name: "x", build: { commands: ["ok", 7] } });
+  assert.equal(badItems.ok, false);
+  assert.ok(badItems.errors.some((e) => e.includes("build.commands")));
+});
+
+test("validateRecipe rejects a non-string build.cwd", () => {
+  const result = validateRecipe({ name: "x", build: { commands: ["make"], cwd: 3 } });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((e) => e.includes("build.cwd")));
+});
+
 test("validateRecipe fills defaults for omitted optional fields", () => {
   const result = validateRecipe({ name: "x" });
   assert.equal(result.ok, true);

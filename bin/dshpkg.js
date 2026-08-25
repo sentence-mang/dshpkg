@@ -35,7 +35,7 @@ import {
   loadAllRecipes,
 } from "../lib/repo.js";
 import { refreshIndex } from "../lib/indexer.js";
-import { install, remove, defaultRunner } from "../lib/transaction.js";
+import { install, remove, defaultRunner, defaultInstallRunner } from "../lib/transaction.js";
 import { isOpen, closeCircuit } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
 import { runDshSync } from "../lib/launcher.js";
@@ -208,7 +208,9 @@ function transactionRecipe(recipe) {
       : source?.spec
         ? source.spec
         : recipe?.name ?? "";
-  return { name: recipe.name, source: spec, deps: recipe.deps ?? [] };
+  const entry = { name: recipe.name, source: spec, deps: recipe.deps ?? [] };
+  if (recipe.build && typeof recipe.build === "object") entry.build = recipe.build;
+  return entry;
 }
 
 // --- command handlers (each wraps its body; errors are Chinese) -------------
@@ -257,6 +259,7 @@ async function cmdInstall(ctx, args, opts) {
       profile,
       dryRun: Boolean(opts.dryRun),
       runner: ctx.runner,
+      installRunner: ctx.installRunner ?? ctx.runner,
     });
     if (!result.ok) throw new Error(result.error);
     if (opts.dryRun) {
@@ -372,6 +375,7 @@ async function cmdUpgrade(ctx, args, opts) {
         profile,
         dryRun: Boolean(opts.dryRun),
         runner: ctx.runner,
+        installRunner: ctx.installRunner ?? ctx.runner,
       });
       if (!result.ok) {
         ctx.error(`升级失败: ${name}（${result.error}）`);
@@ -1002,13 +1006,20 @@ export function defaultDshRun(args, deps = {}) {
   return runDshSync(args, { options: { encoding: "utf8" }, ...deps });
 }
 
-/** Build the injectable context from user overrides (tests inject fakes). */
-function makeCtx({ log, error, ask, runner, dshRun, fetcher, spawnImpl } = {}) {
+/**
+ * Build the injectable context from user overrides (tests inject fakes).
+ * When tests inject a dsh `runner`, the add steps reuse it (so the fakes see
+ * every call); in production the add steps use the capturing install runner
+ * so pnpm output (allowBuilds hints, network errors) can be inspected.
+ */
+function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl } = {}) {
+  const resolvedRunner = runner ?? defaultRunner;
   return {
     log: log ?? ((...a) => console.log(...a)),
     error: error ?? ((...a) => console.error(...a)),
     ask: ask ?? defaultAsk,
-    runner: runner ?? defaultRunner,
+    runner: resolvedRunner,
+    installRunner: installRunner ?? (runner ? resolvedRunner : defaultInstallRunner),
     dshRun: dshRun ?? defaultDshRun,
     fetcher: fetcher ?? null,
     spawnImpl: spawnImpl ?? null,
