@@ -12,6 +12,8 @@ import {
   refreshIndex,
   readIndex,
   parseAwesomeMarkdown,
+  importLocalMarketplace,
+  applyDshSoOverlay,
   SOURCES,
   USER_AGENT,
 } from "../lib/indexer.js";
@@ -109,17 +111,90 @@ const DSH_SO_ITEMS = {
   ],
 };
 
-/** Point DSH_PKG_HOME at a fresh temp dir; restore it after the test. */
+/**
+ * Point DSH_PKG_HOME + DSH_HOME at a fresh temp dir; restore after the test.
+ * DSH_HOME must be isolated too: refreshIndex imports the local marketplace
+ * cache from <DSH_HOME>/plugin-manager-cache, which would otherwise leak the
+ * real ~/.dsh cache (~7MB, 10k+ entries) into the assertions.
+ */
 async function withTempState(t) {
   const dir = await mkdtemp(join(tmpdir(), "dshpkg-idx-"));
-  const prev = process.env.DSH_PKG_HOME;
+  const prevPkg = process.env.DSH_PKG_HOME;
+  const prevHome = process.env.DSH_HOME;
   process.env.DSH_PKG_HOME = dir;
+  process.env.DSH_HOME = dir;
   t.after(() => {
-    if (prev === undefined) delete process.env.DSH_PKG_HOME;
-    else process.env.DSH_PKG_HOME = prev;
+    if (prevPkg === undefined) delete process.env.DSH_PKG_HOME;
+    else process.env.DSH_PKG_HOME = prevPkg;
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
   });
   return dir;
 }
+
+/**
+ * Write fake local cache files under <home>/plugin-manager-cache (the layout
+ * of the real dsh plugin-manager UI). Omitted keys are not written.
+ */
+async function writeLocalCache(home, { marketplace, dshso } = {}) {
+  const dir = join(home, "plugin-manager-cache");
+  await mkdir(dir, { recursive: true });
+  if (marketplace !== undefined) {
+    await writeFile(join(dir, "marketplace.json"), JSON.stringify(marketplace), "utf8");
+  }
+  if (dshso !== undefined) {
+    await writeFile(join(dir, "dshso-index.json"), JSON.stringify(dshso), "utf8");
+  }
+  return dir;
+}
+
+const MARKETPLACE_PAYLOAD = {
+  version: 3,
+  fetchedAt: "2026-08-23T10:00:00.000Z",
+  source: "registry",
+  items: [
+    {
+      name: "acme/dsh-foo", // ownerRepo
+      displayName: "dsh-foo",
+      description: "本地市场里的 foo 插件",
+      stars: 42,
+      url: "https://github.com/acme/dsh-foo",
+      topics: ["dsh-plugin", "tool"],
+      packageName: "dsh-foo",
+      latestVersion: "1.0.0",
+      category: "tool",
+      installed: false,
+      verification: { level: 3, label: "L3 · Install spec" },
+      security: { riskLevel: "low", status: "audited" },
+    },
+    {
+      name: "solo/dsh-bare", // no packageName -> key falls back to ownerRepo
+      displayName: "dsh-bare",
+      description: "无包名、无验证信息的条目",
+      stars: 0,
+      url: "https://github.com/solo/dsh-bare",
+      topics: [],
+      // no latestVersion / verification / security at all
+    },
+    { displayName: "Ghost" }, // no ownerRepo, no packageName -> skipped
+  ],
+};
+
+const DSHSO_LOCAL_PAYLOAD = {
+  savedAt: "2026-08-24T01:06:27.784Z",
+  entries: [
+    {
+      name: "dsh-foo", // matches acme/dsh-foo by name AND packageName
+      verification: { level: 2, label: "L2 · Structured" },
+      security: { riskLevel: "medium", status: "pending" },
+    },
+    {
+      name: "no-such-plugin", // matches nothing
+      verification: { level: 3, label: "L3 · Install spec" },
+      security: { riskLevel: "low", status: "audited" },
+    },
+  ],
+};
 
 // ---- tests ----------------------------------------------------------------
 
@@ -336,4 +411,170 @@ test("parseAwesomeMarkdown extracts entries with categories, skips TOC/badges", 
   // TOC lines ("- [插件](#插件)") and badge images are skipped
   assert.equal(parsed.some((p) => p.url.includes("awesome-dsh-plugin.com")), false);
   assert.equal(parsed.some((p) => p.ownerRepo.includes("插件")), false);
+});
+
+// ---- local marketplace import (offline source) ----------------------------
+
+test("importLocalMarketplace normalizes marketplace.json into the unified shape", async (t) => {
+  const home = await withTempState(t);
+  await writeLocalCache(home, { marketplace: MARKETPLACE_PAYLOAD });
+
+  const { items, count } = await importLocalMarketplace();
+  assert.equal(count, 2); // the keyless Ghost entry is skipped
+
+  const foo = items.find((i) => i.ownerRepo === "acme/dsh-foo");
+  assert.equal(foo.key, "dsh-foo"); // key prefers packageName
+  assert.equal(foo.name, "dsh-foo"); // name from displayName
+  assert.equal(foo.description, "本地市场里的 foo 插件");
+  assert.equal(foo.stars, 42);
+  assert.equal(foo.url, "https://github.com/acme/dsh-foo");
+  assert.deepEqual(foo.topics, ["dsh-plugin", "tool"]);
+  assert.equal(foo.latestVersion, "1.0.0");
+  assert.deepEqual(foo.verification, { level: 3, label: "L3 · Install spec" });
+  assert.deepEqual(foo.security, { riskLevel: "low", status: "audited" });
+
+  // no packageName: key falls back to ownerRepo, name to the repo name
+  const bare = items.find((i) => i.ownerRepo === "solo/dsh-bare");
+  assert.equal(bare.key, "solo/dsh-bare");
+  assert.equal(bare.name, "dsh-bare");
+  assert.equal(bare.latestVersion, null);
+  assert.deepEqual(bare.verification, { level: "unknown", label: "未知" });
+  assert.deepEqual(bare.security, { riskLevel: "unknown", status: "unreviewed" });
+});
+
+test("importLocalMarketplace never fails: missing, corrupt or wrong-shaped files skip", async (t) => {
+  const home = await withTempState(t);
+  // no cache directory at all
+  assert.deepEqual(await importLocalMarketplace(), { items: [], count: 0 });
+
+  await mkdir(join(home, "plugin-manager-cache"), { recursive: true });
+  const file = join(home, "plugin-manager-cache", "marketplace.json");
+
+  // corrupt JSON
+  await writeFile(file, "{not json", "utf8");
+  assert.deepEqual(await importLocalMarketplace(), { items: [], count: 0 });
+
+  // wrong shape (items not an array)
+  await writeFile(file, JSON.stringify({ version: 3, items: 42 }), "utf8");
+  assert.deepEqual(await importLocalMarketplace(), { items: [], count: 0 });
+});
+
+test("applyDshSoOverlay overrides verification/security by name/packageName match", () => {
+  const items = [
+    { name: "Alpha", packageName: "dsh-alpha", verification: { level: "unverified" }, security: { riskLevel: "unknown", status: "unreviewed" } },
+    { name: "Beta", packageName: "", verification: { level: "unverified" }, security: { riskLevel: "unknown", status: "unreviewed" } },
+  ];
+  const entries = [
+    // matches item 0 by packageName (case-insensitive)
+    { name: "DSH-ALPHA", verification: { level: 3, label: "L3 · Install spec" }, security: { riskLevel: "low", status: "audited" } },
+    // matches item 1 by name only (no packageName on the item)
+    { name: "beta", verification: { level: 1, label: "L1 · Found" }, security: { riskLevel: "low", status: "audited" } },
+    // matches nothing
+    { name: "ghost", verification: { level: 3, label: "L3 · Install spec" }, security: { riskLevel: "low", status: "audited" } },
+  ];
+  assert.equal(applyDshSoOverlay(items, entries), 2);
+  assert.deepEqual(items[0].verification, { level: 3, label: "L3 · Install spec" });
+  assert.deepEqual(items[0].security, { riskLevel: "low", status: "audited" });
+  assert.deepEqual(items[1].verification, { level: 1, label: "L1 · Found" });
+  assert.deepEqual(items[1].security, { riskLevel: "low", status: "audited" });
+
+  // non-array inputs degrade to 0, never throw
+  assert.equal(applyDshSoOverlay(null, entries), 0);
+  assert.equal(applyDshSoOverlay(items, null), 0);
+});
+
+test("network failure with a local marketplace still refreshes successfully", async (t) => {
+  const home = await withTempState(t);
+  await writeLocalCache(home, { marketplace: MARKETPLACE_PAYLOAD, dshso: DSHSO_LOCAL_PAYLOAD });
+
+  // all four network sources down (the anonymous GitHub 403 scenario)
+  const fetcher = makeFetcher({
+    "api.github.com": { error: new Error("HTTP 403 for github") },
+    "registry.npmjs.org": { error: new Error("HTTP 403 for npm") },
+    "raw.githubusercontent.com": { error: new Error("HTTP 403 for awesome") },
+    "dsh.so": { error: new Error("dsh.so down") },
+  });
+
+  const res = await refreshIndex({ force: true, fetcher });
+  assert.equal(res.ok, true); // local entries make it a successful refresh
+  assert.equal(res.skipped, false);
+  assert.equal(res.count, 2);
+  assert.match(res.lastError, /403 for github/); // network error stays visible
+  assert.deepEqual(res.sources, { github: 0, npm: 0, awesome: 0, local: 2, dshso: 1 });
+
+  const items = await readIndex();
+  assert.equal(items.length, 2);
+
+  // dshso overlay won: the L3 marketplace verdict is replaced by dsh.so's L2
+  // (authoritative override, even downward), the unmatched entry adds nothing
+  const foo = items.find((i) => i.ownerRepo === "acme/dsh-foo");
+  assert.deepEqual(foo.verification, { level: 2, label: "L2 · Structured" });
+  assert.deepEqual(foo.security, { riskLevel: "medium", status: "pending" });
+  const bare = items.find((i) => i.ownerRepo === "solo/dsh-bare");
+  assert.deepEqual(bare.verification, { level: "unknown", label: "未知" });
+
+  // meta.json records the source counts
+  const meta = JSON.parse(await readFile(join(home, "index", "meta.json"), "utf8"));
+  assert.equal(meta.count, 2);
+  assert.match(meta.lastError, /403/);
+  assert.deepEqual(meta.sources, { github: 0, npm: 0, awesome: 0, local: 2, dshso: 1 });
+});
+
+test("local marketplace merges with network sources under the dual-key rules", async (t) => {
+  const home = await withTempState(t);
+  await writeLocalCache(home, { marketplace: MARKETPLACE_PAYLOAD }); // no dshso file
+
+  const fetcher = makeFetcher({
+    "api.github.com": githubPayload([
+      {
+        full_name: "acme/dsh-foo",
+        name: "dsh-foo",
+        description: "github description",
+        stargazers_count: 999,
+        html_url: "https://github.com/acme/dsh-foo",
+        topics: ["extra-topic"],
+      },
+    ]),
+    "registry.npmjs.org": npmPayload([]),
+    "raw.githubusercontent.com": awesomePayload("# Awesome\n## 插件\n### 分类\n"),
+    "dsh.so": { error: new Error("dsh.so down") }, // best-effort source
+  });
+
+  const res = await refreshIndex({ force: true, fetcher });
+  assert.equal(res.ok, true);
+  assert.equal(res.count, 2); // acme/dsh-foo merged with its GitHub twin
+  assert.deepEqual(res.sources, { github: 1, npm: 0, awesome: 0, local: 2, dshso: 0 });
+
+  const items = await readIndex();
+  const foo = items.find((i) => i.ownerRepo === "acme/dsh-foo");
+  // local fields win (inserted first), GitHub fills nothing, stars take the
+  // max, topics union — and the numeric L3 rank is not displaced by the
+  // GitHub "unverified" rank-1 badge
+  assert.equal(foo.description, "本地市场里的 foo 插件");
+  assert.equal(foo.stars, 999);
+  assert.deepEqual(foo.topics, ["dsh-plugin", "tool", "extra-topic"]);
+  assert.equal(foo.latestVersion, "1.0.0");
+  assert.equal(foo.verification.level, 3);
+});
+
+test("the local marketplace is re-imported on every refresh", async (t) => {
+  const home = await withTempState(t);
+  const fetcher = makeFetcher({
+    "api.github.com": githubPayload([]),
+    "registry.npmjs.org": npmPayload([]),
+    "raw.githubusercontent.com": awesomePayload("# none\n"),
+    "dsh.so": dshsoPayload({ items: [] }),
+  });
+  await writeLocalCache(home, {
+    marketplace: { items: [MARKETPLACE_PAYLOAD.items[0]] },
+  });
+  const first = await refreshIndex({ force: true, fetcher });
+  assert.equal(first.count, 1);
+
+  // another tool updates the cache between refreshes — picked up on the next
+  // refresh without any flag
+  await writeLocalCache(home, { marketplace: MARKETPLACE_PAYLOAD });
+  const second = await refreshIndex({ force: true, fetcher });
+  assert.equal(second.count, 2);
+  assert.equal(second.sources.local, 2);
 });

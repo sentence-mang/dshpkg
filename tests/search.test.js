@@ -8,7 +8,13 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { search, searchSemantic, scoreItem } from "../lib/search.js";
+import {
+  search,
+  searchSemantic,
+  scoreItem,
+  SCORE_PREFIX,
+  SCORE_CONTAINS,
+} from "../lib/search.js";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -235,6 +241,88 @@ test("name collisions keep the highest score and mark alternates", async (t) => 
   assert.equal(results[0].alternates[0].key, "low");
   assert.equal(results[0].alternates[0].score, 100);
   assert.equal(results[0].alternates[0].installed, false);
+});
+
+test("packageName prefix and contains score identically to name matches", async (t) => {
+  await withTempEnv(t);
+  const index = [
+    item({ key: "p", name: "first-unrelated", packageName: "dsh-foo-pre" }), // prefix via packageName
+    item({ key: "c", name: "second-unrelated", packageName: "x-dsh-foo-y" }), // contains via packageName
+    item({ key: "n", name: "dsh-foo-pre", ownerRepo: "a/dsh-foo-pre" }), // prefix via name
+  ];
+  const results = await search("dsh-foo", { state: { packages: {} }, index });
+  const byKey = Object.fromEntries(results.map((r) => [r.key, r.score]));
+  assert.equal(byKey.p, SCORE_PREFIX); // 60 — same weight as a name prefix hit
+  assert.equal(byKey.c, SCORE_CONTAINS); // 30 — same weight as a name contains hit
+  assert.equal(byKey.n, SCORE_PREFIX);
+});
+
+test("ecosystemOnly keeps only dsh-prefixed packages or dsh-topic entries", async (t) => {
+  await withTempEnv(t);
+  const index = [
+    // kept: packageName starts with "dsh"
+    item({ key: "dsh-alpha", name: "dsh-alpha", packageName: "dsh-alpha" }),
+    // kept: topic "dsh-plugin" even though the packageName is generic
+    item({ key: "beta", name: "dsh-beta", packageName: "memory-beta", topics: ["dsh-plugin"] }),
+    // kept: topic "deepseek"
+    item({ key: "delta", name: "dsh-delta", packageName: "ds-delta", topics: ["deepseek"] }),
+    // dropped: keyword hit but neither a dsh* package nor a dsh topic
+    item({ key: "noise", name: "x-dsh-y", packageName: "x-dsh-y", topics: ["unrelated"] }),
+    // dropped: only the bare name starts with dsh — name alone does not count
+    item({ key: "name-only", name: "dsh-name-only", ownerRepo: "a/dsh-name-only" }),
+  ];
+
+  // without the flag everything keyword-relevant shows up (default unchanged)
+  const all = await search("dsh", { state: { packages: {} }, index });
+  assert.deepEqual(all.map((r) => r.key).sort(), ["beta", "delta", "dsh-alpha", "name-only", "noise"]);
+
+  const eco = await search("dsh", { state: { packages: {} }, index, ecosystemOnly: true });
+  assert.deepEqual(eco.map((r) => r.key).sort(), ["beta", "delta", "dsh-alpha"]);
+});
+
+test("ecosystemOnly also filters online-merged entries", async (t) => {
+  await withTempEnv(t);
+  const fetcher = makeFetcher({
+    "api.github.com": {
+      json: {
+        items: [
+          {
+            full_name: "live/noise-dsh",
+            name: "noise-dsh",
+            description: "a dsh-named repo that is not ecosystem",
+            stargazers_count: 0,
+            html_url: "https://github.com/live/noise-dsh",
+            topics: [],
+          },
+        ],
+      },
+    },
+    "registry.npmjs.org": {
+      json: {
+        objects: [
+          {
+            package: {
+              name: "dsh-live",
+              description: "live ecosystem package",
+              version: "1.0.0",
+              links: { npm: "https://www.npmjs.com/package/dsh-live" },
+            },
+          },
+        ],
+      },
+    },
+  });
+
+  const results = await search("dsh", {
+    online: true,
+    ecosystemOnly: true,
+    state: { packages: {} },
+    index: [],
+    fetcher,
+  });
+  // the GitHub noise entry keyword-matches "dsh" but is filtered out; the
+  // dsh-live npm entry survives
+  assert.deepEqual(results.map((r) => r.packageName), ["dsh-live"]);
 });
 
 test("searchSemantic extracts lowercase keywords, drops stopwords, de-dupes", async () => {
