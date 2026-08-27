@@ -46,6 +46,18 @@ graph TB
 
 ## 安装
 
+**方式一：npm 全局安装（发布后）**
+
+```powershell
+npm install -g dshpkg@next     # 预发布版本（0.1.0-rc.x）
+# 正式版发布后：npm install -g dshpkg
+dshpkg help                    # 验证安装
+dshpkg repo init               # 首次使用：添加默认社区仓库
+dshpkg update                  # 拉取配方与索引
+```
+
+**方式二：作为 profile 插件挂载（开发/本地）**
+
 dshpkg 以 profile 插件的形式挂载。**本地路径必须使用 `link:` 前缀**（官方 reconciler 只识别带 `link:` 的 bundle 声明，见 CONTRACTS.md 已验证事实）：
 
 ```powershell

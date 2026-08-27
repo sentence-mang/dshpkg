@@ -2,7 +2,7 @@
 
 dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [0.1.0] - 2026-08-27（开发中，未发布）
+## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 
 ### Breaking Changes（升级注意）
 

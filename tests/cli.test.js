@@ -480,7 +480,7 @@ test("self-upgrade rolls back to the previous version when smoke fails (P4-2)", 
   const code = await runCli(["self-upgrade"], io);
   assert.equal(code, 1);
   assert.deepEqual(calls[1], ["help"]);
-  assert.deepEqual(calls[2], ["add", "-g", "dshpkg@0.1.0"]); // rollback to current
+  assert.deepEqual(calls[2], ["add", "-g", "dshpkg@0.1.0-rc.1"]); // rollback to current
   assert.ok(errors.join("\n").includes("回退"), errors.join("\n"));
 });
 

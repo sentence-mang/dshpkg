@@ -20,10 +20,10 @@
 
 ## 发布前必须由用户决策的项（资产风险）
 
-- [ ] **npm 发布**：package.json 目前 `"private": true`（防误发）。
-      - 需要：把 `private` 改为 `false`（或移除），确认包名 `dshpkg` 未被占用；
-      - 执行 `npm publish`（或 pnpm publish）——这是**发布动作**，由用户执行；
-      - 发布后核对：`npm view dshpkg` 版本号、`dshpkg --version`/`help` 可用。
+- [x] **npm 发布准备（代码侧完成）**：`private` 已改为 `false`，版本 `0.1.0-rc.1`（与 tag `v0.1.0-rc.1` 对齐）；
+      包名 `dshpkg` 经 `npm view dshpkg` 确认**未被占用**。
+      **待执行（需 npm 登录）**：`npm login` → `npm publish --tag next`（rc 进 next dist-tag）；
+      发布后核对：`npm view dshpkg@next version`、`npm i -g dshpkg@next` 后 `dshpkg help` 可用。
 - [ ] **社区配方仓库 URL**：`lib/defaults.js` 的占位 URL（github.com/OWNER/dsh-community）
       需替换为真实仓库（批准决议：发布前由用户定最终 URL）。
       **当前状态：保持占位 + TODO**；`dshpkg repo init` 支持 `DSH_DEFAULT_REPOS` 环境变量注入
