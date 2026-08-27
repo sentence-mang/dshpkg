@@ -46,3 +46,11 @@ dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-
 - supervisor 单实例互斥锁（supervisor.lock）
 - `dshpkg self-upgrade` 事务化升级（快照 + 冒烟 + 失败回退）
 - `dshpkg daemon install/uninstall/status`（Windows 计划任务，每 5 分钟拉起看门狗）
+
+### 依赖管理自动化（2026-08-27 补强）
+
+- **依赖闭包递归展开**：配方的字符串依赖经配方库递归解析——依赖的依赖自动安装，
+  不再需要人工逐个补齐；无配方的依赖保持裸安装（pnpm 原生解析其声明依赖）
+- **`doctor --fix`**：一键自动安装依赖图中所有缺失依赖（按配方版本）
+- **`dshpkg autoremove`**：孤儿包（已装、非 bundle、无任何已装包引用）一键清理，
+  `--dry-run` 演练；bundle 与仍被引用的包永不触碰

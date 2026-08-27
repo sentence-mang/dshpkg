@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveDeps,
+  expandDeps,
   install,
   remove,
   autoremove,
@@ -114,6 +115,52 @@ test("resolveDeps throws with the cycle path in the message", () => {
     assert.match(err.message, /x → x/);
     return true;
   });
+});
+
+// ---------------------------------------------------------------- expandDeps
+
+test("expandDeps resolves string deps through the recipe table recursively", () => {
+  const libdep2 = { name: "libdep2", source: { type: "npm", spec: "libdep2@1.0.0" } };
+  const libdep = {
+    name: "libdep",
+    source: { type: "npm", spec: "libdep@1.0.0" },
+    deps: ["libdep2"],
+  };
+  const app = {
+    name: "app",
+    source: { type: "npm", spec: "app@1.0.0" },
+    deps: ["libdep", "unknown-dep"],
+  };
+  const table = new Map([
+    ["libdep", libdep],
+    ["libdep2", libdep2],
+  ]);
+  const expanded = expandDeps(app, table);
+  // libdep expanded into its recipe with libdep2 nested; unknown stays a string
+  assert.deepEqual(expanded.deps[0], {
+    ...libdep,
+    deps: [{ ...libdep2, deps: [] }],
+  });
+  assert.equal(expanded.deps[1], "unknown-dep");
+  // a recipe without deps gains an empty deps array (validated shape), nothing else
+  const solo = expandDeps(libdep2, table);
+  assert.equal(solo.name, "libdep2");
+  assert.deepEqual(solo.deps, []);
+});
+
+test("expandDeps stays finite on cyclic recipes (resolveEntries reports later)", () => {
+  const a = { name: "a", deps: ["b"] };
+  const b = { name: "b", deps: ["a"] };
+  const table = new Map([
+    ["a", a],
+    ["b", b],
+  ]);
+  const expanded = expandDeps(a, table);
+  // expansion terminates; the cycle is preserved for resolveEntries to flag
+  assert.equal(expanded.deps[0].name, "b");
+  assert.equal(expanded.deps[0].deps[0], a); // back-reference, not infinite
+  // and the full expanded graph is still rejected by resolveDeps
+  assert.throws(() => resolveDeps(expanded, {}), /循环依赖/);
 });
 
 test("resolveDeps throws on a recipe without a name", () => {

@@ -41,7 +41,7 @@ import {
   loadAllRecipes,
 } from "../lib/repo.js";
 import { refreshIndex, readIndex } from "../lib/indexer.js";
-import { install, remove, defaultRunner, defaultInstallRunner } from "../lib/transaction.js";
+import { install, remove, defaultRunner, defaultInstallRunner, autoremove, expandDeps } from "../lib/transaction.js";
 import { isOpen, closeCircuit, isDangerousKey } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
 import { runDshSync } from "../lib/launcher.js";
@@ -238,6 +238,19 @@ function transactionRecipe(recipe) {
   const entry = { name: recipe.name, source: spec, deps: recipe.deps ?? [] };
   if (recipe.build && typeof recipe.build === "object") entry.build = recipe.build;
   return entry;
+}
+
+/**
+ * Expand a recipe's string deps through the recipe library (recursively), so
+ * the transaction installs the COMPLETE closure — deps of deps included —
+ * without anyone having to install them by hand.
+ */
+async function expandRecipeClosure(recipe) {
+  if (!recipe) return recipe;
+  const recipeByName = new Map(
+    (await loadAllRecipes()).map(({ recipe: r }) => [r.name, r]),
+  );
+  return expandDeps(recipe, recipeByName);
 }
 
 // --- smart install resolution (fuzzy word -> candidate -> install) ---------
@@ -476,6 +489,9 @@ async function cmdInstall(ctx, args, opts) {
     const state = await readState();
     const profile = opts.profile ?? state.profile ?? "web";
     let recipe = await probeRecipe(spec);
+    // Full dependency closure: string deps resolve through the recipe
+    // library recursively, so deps of deps install automatically too.
+    recipe = await expandRecipeClosure(recipe);
     let target = recipe ? transactionRecipe(recipe) : spec;
     let name = recipe?.name ?? displayNameOf(spec);
     let recordSpec = spec; // what state.packages[].source records
@@ -489,7 +505,7 @@ async function cmdInstall(ctx, args, opts) {
       if (typeof resolved === "number") return resolved;
       target = resolved.target;
       name = resolved.name;
-      recipe = resolved.recipe;
+      recipe = await expandRecipeClosure(resolved.recipe);
       recordSpec = resolved.recordSpec;
     }
 
@@ -1167,7 +1183,71 @@ async function cmdDoctor(ctx, _args, opts) {
     }
     ctx.log(`依赖图检查: ${recipes.length} 个配方, ${problems.length} 处缺失依赖`);
     for (const problem of problems.slice(0, 10)) ctx.error(`  - ${problem}`);
+
+    // --fix: install every missing dependency automatically (no waiting for
+    // a human to run install by hand).
+    if (opts.fix && problems.length > 0) {
+      ctx.log("自动修复: 安装缺失依赖...");
+      const recipeByName = new Map(recipes.map(({ recipe: r }) => [r.name, r]));
+      let failures = 0;
+      for (const problem of problems) {
+        const depName = problem.split(" 缺少依赖 ")[1]?.trim();
+        if (!depName) continue;
+        const depRecipe = recipeByName.get(depName);
+        const specOrRecipe = depRecipe
+          ? await expandRecipeClosure(depRecipe)
+          : depName;
+        const result = await install(specOrRecipe, {
+          profile,
+          runner: ctx.runner ?? defaultRunner,
+          installRunner: ctx.installRunner ?? ctx.runner ?? defaultRunner,
+          gitRunner: ctx.gitRunner ?? undefined,
+        });
+        if (!result.ok) {
+          ctx.error(`修复失败: ${depName}（${result.error}）`);
+          failures += 1;
+        } else {
+          ctx.log(`✓ 已安装缺失依赖 ${depName}`);
+        }
+      }
+      if (failures > 0) {
+        ctx.error(`仍有 ${failures} 处依赖修复失败`);
+        return 1;
+      }
+      ctx.log("缺失依赖已全部自动修复");
+      return 0;
+    }
     return problems.length === 0 ? 0 : 1;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/**
+ * `dshpkg autoremove` — remove orphan packages (installed, non-bundle, and
+ * referenced by nothing else installed). Never touches bundles or referenced
+ * packages; `--dry-run` only lists them.
+ */
+async function cmdAutoremove(ctx, _args, opts) {
+  try {
+    const profile = opts.profile ?? (await readState()).profile ?? "web";
+    const result = await autoremove({
+      profile,
+      dryRun: Boolean(opts.dryRun),
+      runner: ctx.runner ?? defaultRunner,
+    });
+    if (!result.ok) throw new Error(result.error);
+    if (result.removed.length === 0) {
+      ctx.log("没有可清理的孤儿包");
+      return 0;
+    }
+    ctx.log(
+      opts.dryRun
+        ? `将清理 ${result.removed.length} 个孤儿包: ${result.removed.join(", ")}`
+        : `已清理 ${result.removed.length} 个孤儿包: ${result.removed.join(", ")}`,
+    );
+    return 0;
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
     return 1;
@@ -1388,6 +1468,7 @@ export const COMMANDS = new Map([
   ["info", cmdInfo],
   ["why", cmdWhy],
   ["doctor", cmdDoctor],
+  ["autoremove", cmdAutoremove],
   ["audit", cmdAudit],
   ["fix-broken", cmdFixBroken],
   ["log", cmdLog],
@@ -1421,7 +1502,8 @@ export function helpText() {
     "  list                      列出插件（--installed 仅看已安装）",
     "  info <名称>               配方详情、依赖与崩溃计数",
     "  why <名称>                依赖反查：哪些配方依赖它",
-    "  doctor                    校验组合树与依赖图（dsh --dump-config）",
+    "  doctor [--fix]             校验组合树与依赖图（--fix 自动安装缺失依赖）",
+    "  autoremove                 清理孤儿包（被卸载插件的残留依赖；--dry-run 演练）",
     "  audit                     最近 20 条崩溃记录 + 电路状态汇总",
     "  fix-broken                交互式修复 circuit-open 的插件",
     "  log                       输出崩溃事件流（incidents.jsonl）",
@@ -1464,6 +1546,7 @@ const KNOWN_FLAGS = new Set([
   "--",
   "--no-default",
   "--format",
+  "--fix",
 ]);
 
 /**
@@ -1483,6 +1566,7 @@ export function parseArgs(argv) {
     port: null,
     help: false,
     yes: false,
+    fix: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -1517,6 +1601,10 @@ export function parseArgs(argv) {
     }
     if (arg === "--yes") {
       opts.yes = true;
+      continue;
+    }
+    if (arg === "--fix") {
+      opts.fix = true;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {

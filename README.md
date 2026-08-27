@@ -99,7 +99,7 @@ dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
 
-## CLI 命令（29 个命令入口）
+## CLI 命令（30 个命令入口）
 
 | 命令 | 说明 |
 | --- | --- |
@@ -117,7 +117,8 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 | `list` | 列出插件（`--installed` 仅看已安装） |
 | `info <名称>` | 配方详情、依赖与崩溃计数 |
 | `why <名称>` | 依赖反查：哪些配方依赖它 |
-| `doctor` | 校验组合树与依赖图（dsh --dump-config） |
+| `doctor [--fix]` | 校验组合树与依赖图（`--fix` 自动安装缺失依赖） |
+| `autoremove` | 清理孤儿包（卸载插件的残留依赖；`--dry-run` 演练） |
 | `audit` | 最近 20 条崩溃记录 + 电路状态汇总 |
 | `fix-broken` | 交互式修复 circuit-open 的插件 |
 | `log` | 输出崩溃事件流（incidents.jsonl） |

@@ -556,8 +556,10 @@ test("install from a recipe repo resolves deps first and records all entries", a
   assert.equal(code, 0);
   const adds = calls.filter((c) => c[0] === "plugin");
   assert.equal(adds.length, 2);
-  assert.equal(adds[0][4], "libdep"); // string deps install by name
-  assert.equal(adds[1][4], "app@1.0.0"); // self last
+  // deps resolve through the recipe library: libdep installs with its recipe
+  // version (full closure), self last
+  assert.equal(adds[0][4], "libdep@0.5.0");
+  assert.equal(adds[1][4], "app@1.0.0");
   const state = await readState();
   assert.ok(state.packages["app"]);
   assert.ok(state.packages["libdep"]);
@@ -1236,6 +1238,76 @@ test("doctor flags missing dependencies in the graph", async (t) => {
   const code = await runCli(["doctor"], io);
   assert.equal(code, 1);
   assert.ok(errors.join("\n").includes("app 缺少依赖 libdep"));
+});
+
+test("doctor --fix installs missing dependencies automatically", async (t) => {
+  await makeEnv(t, { packages: { app: { version: "1.0.0" } } });
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { deps: ["libdep"] }),
+    libdep: recipeOf("libdep", "libdep@0.5.0"),
+  });
+  const { calls, runner } = fakeRunner();
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, logs } = captureIo({ dshRun, runner });
+  const code = await runCli(["doctor", "--fix"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("已安装缺失依赖 libdep"), logs.join("\n"));
+  const addCall = calls.find((c) => c[0] === "plugin" && c.includes("add"));
+  assert.ok(addCall, "libdep installed via the official channel");
+  assert.ok(addCall.some((a) => a.includes("libdep")), addCall.join(" "));
+});
+
+// ----------------------------------------------------------------- autoremove
+
+test("autoremove removes orphan packages and keeps bundles (CLI)", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  // app is a bundle (never autoremoved); orphan is plain and unreferenced
+  await mkdir(join(profileDir, "node_modules", "app"), { recursive: true });
+  await writeFile(
+    join(profileDir, "node_modules", "app", "package.json"),
+    JSON.stringify({ name: "app", dsh: { bundle: { patch: "cordis.patch.yml" } } }),
+  );
+  await mkdir(join(profileDir, "node_modules", "orphan"), { recursive: true });
+  await writeFile(
+    join(profileDir, "node_modules", "orphan", "package.json"),
+    JSON.stringify({ name: "orphan" }),
+  );
+  const manifestPath = join(profileDir, "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.dependencies = { app: "1.0.0", orphan: "1.0.0" };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+
+  const { calls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["autoremove"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("已清理 1 个孤儿包"), logs.join("\n"));
+  const removeCall = calls.find((c) => c[0] === "plugin" && c.includes("remove"));
+  assert.ok(removeCall && removeCall.includes("orphan"), removeCall?.join(" "));
+  assert.ok(
+    !calls.some((c) => c.includes("remove") && c.includes("app")),
+    "bundle untouched",
+  );
+});
+
+test("autoremove --dry-run lists orphans without invoking dsh", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  await mkdir(join(profileDir, "node_modules", "orphan"), { recursive: true });
+  await writeFile(
+    join(profileDir, "node_modules", "orphan", "package.json"),
+    JSON.stringify({ name: "orphan" }),
+  );
+  const manifestPath = join(profileDir, "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.dependencies = { orphan: "1.0.0" };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+
+  const { calls, runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["autoremove", "--dry-run"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("将清理 1 个孤儿包"), logs.join("\n"));
+  assert.equal(calls.length, 0);
 });
 
 // -------------------------------------------------------------------- audit
