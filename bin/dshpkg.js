@@ -12,7 +12,7 @@
 //   - comments in English, user-facing output in Chinese;
 //   - log/error/ask/runner/fetcher are injectable so tests stay offline.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -769,6 +769,24 @@ async function cmdSelfUpgrade(ctx, args, opts) {
   }
 }
 
+/** schtasks runner for daemon management: spawnSync, never a shell (and
+ * never through the dsh launcher — that is what this dedicated runner is
+ * for: the daemon commands talk to the OS task scheduler directly). */
+function schtasksRunner(args) {
+  const result = spawnSync("schtasks", args, {
+    encoding: "utf8",
+    shell: false,
+    windowsHide: true,
+    timeout: 30_000,
+  });
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error,
+  };
+}
+
 /**
  * P4-1: Windows Task Scheduler integration — register a task that re-launches
  * supervisor.ps1 every 5 minutes (the supervisor's own single-instance lock
@@ -778,7 +796,7 @@ async function cmdSelfUpgrade(ctx, args, opts) {
 async function cmdDaemon(ctx, args, opts) {
   try {
     const sub = String(args[0] ?? "").trim();
-    const runner = ctx.runner ?? defaultRunner;
+    const runner = ctx.runner ?? schtasksRunner;
     const task = "dshpkg-supervisor";
     if (sub === "install") {
       const profile = opts.profile ?? (await readState()).profile ?? "web";
