@@ -46,15 +46,18 @@ graph TB
 
 ## 安装
 
-**方式一：npm 全局安装（发布后）**
+**方式一：npm 全局安装（已发布）**
 
 ```powershell
-npm install -g dshpkg@next     # 预发布版本（0.1.0-rc.x）
-# 正式版发布后：npm install -g dshpkg
+npm install -g @sentencemang/dshpkg@next   # 预发布版本（0.1.0-rc.x）
+# 正式版发布后：npm install -g @sentencemang/dshpkg
 dshpkg help                    # 验证安装
 dshpkg repo init               # 首次使用：添加默认社区仓库
 dshpkg update                  # 拉取配方与索引
 ```
+
+> 包名说明：npm 防混淆策略拒绝裸名 `dshpkg`（与既有包 `sshpk` 拼写相似），
+> 故以 scope 包 `@sentencemang/dshpkg` 发布；`dshpkg` 命令名不变。
 
 **方式二：作为 profile 插件挂载（开发/本地）**
 
