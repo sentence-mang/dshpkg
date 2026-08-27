@@ -6,12 +6,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generateKeyPairSync, sign } from "node:crypto";
 
 import { runCli, parseArgs, helpText, HOST_PORT, defaultDshRun } from "../bin/dshpkg.js";
-import { readState, writeState, statePath, writeJsonAtomic } from "../lib/state.js";
+import {
+  readState,
+  writeState,
+  statePath,
+  writeJsonAtomic,
+  addTrustedKey,
+} from "../lib/state.js";
+import { canonicalJson } from "../lib/recipe.js";
 
 // ------------------------------------------------------------- test plumbing
 
@@ -150,6 +159,29 @@ function openPackage() {
   };
 }
 
+/** Build a recipeOf with a valid minisign signature (P3-2). */
+function signedRecipeOf(name, sourceSpec, extra = {}) {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const rawPub = Buffer.from(publicKey.export({ format: "jwk" }).x, "base64url");
+  const keyId = "aabbccddeeff0011";
+  const recipe = recipeOf(name, sourceSpec, extra);
+  const data = Buffer.from(canonicalJson(recipe), "utf8");
+  const sig = sign(null, data, privateKey);
+  const signature = Buffer.concat([
+    Buffer.from([0x45, 0x64]),
+    Buffer.from(keyId, "hex"),
+    sig,
+  ]).toString("base64");
+  return {
+    recipe: {
+      ...recipe,
+      signatures: { minisign: { keyId, algo: "ed25519", signature } },
+    },
+    rawPub,
+    keyId,
+  };
+}
+
 // ------------------------------------------------------------------- usage
 
 test("no arguments prints the help text and exits 0", async () => {
@@ -285,6 +317,212 @@ test("install a bare spec installs it and records bookkeeping", async (t) => {
   assert.equal(state.packages["dsh-plugin-x"].version, "2.0.0");
   assert.equal(state.packages["dsh-plugin-x"].held, false);
   assert.ok(logs.join("\n").includes("已安装 dsh-plugin-x"));
+});
+
+test("install success snapshots the profile (P1-3 trigger ①)", async (t) => {
+  await makeEnv(t);
+  const { runner } = fakeRunner();
+  const { io } = captureIo({ runner });
+  const code = await runCli(["install", "dsh-plugin-x@2.0.0"], io);
+  assert.equal(code, 0);
+  const dirs = await readdir(statePath("snapshots"));
+  assert.equal(dirs.length, 1);
+  const manifest = JSON.parse(
+    await readFile(join(statePath("snapshots", dirs[0]), "package.json"), "utf8"),
+  );
+  assert.equal(manifest.name, "web-profile");
+});
+
+// -------------------------------------------------- trust gate (P3-2)
+
+test("install refuses an unsigned non-pinned recipe without --yes (P3-2)", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { pin: { allow: false } }),
+  });
+  const { calls, runner } = fakeRunner();
+  const { io, errors } = captureIo({ runner }); // no ask -> non-interactive
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("拒绝安装"), errors.join("\n"));
+  assert.equal(calls.length, 0); // never reached dsh
+});
+
+test("install --yes installs an unsigned non-pinned recipe (P3-2)", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { pin: { allow: false } }),
+  });
+  const { runner } = fakeRunner();
+  const { io } = captureIo({ runner });
+  const code = await runCli(["install", "app", "--yes"], io);
+  assert.equal(code, 0);
+  const state = await readState();
+  assert.ok(state.packages["app"]);
+});
+
+test("install proceeds for an unsigned recipe with pin.allow (repo-level trust)", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", { app: recipeOf("app", "app@1.0.0") }); // pin.allow true
+  const { runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("pin.allow"), "repo-level trust note shown");
+});
+
+test("install auto-proceeds for a validly signed + trusted recipe (P3-2)", async (t) => {
+  await makeEnv(t);
+  const { recipe, rawPub, keyId } = signedRecipeOf("app", "app@1.0.0");
+  await addTrustedKey(
+    keyId,
+    "test",
+    Buffer.concat([Buffer.from([0x45, 0x64]), Buffer.from(keyId, "hex"), rawPub]).toString("base64"),
+  );
+  await seedRecipeRepo("repo1", { app: recipe });
+  const { runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["install", "app"], io); // no --yes needed
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("已验证"), logs.join("\n"));
+});
+
+test("install refuses a tampered signature even with --yes (P3-2)", async (t) => {
+  await makeEnv(t);
+  const { recipe, rawPub, keyId } = signedRecipeOf("app", "app@1.0.0");
+  const tampered = { ...recipe, name: "evil" }; // payload changed, sig kept
+  await addTrustedKey(
+    keyId,
+    "test",
+    Buffer.concat([Buffer.from([0x45, 0x64]), Buffer.from(keyId, "hex"), rawPub]).toString("base64"),
+  );
+  await seedRecipeRepo("repo1", { evil: tampered });
+  const { calls, runner } = fakeRunner();
+  const { io, errors } = captureIo({ runner });
+  const code = await runCli(["install", "evil", "--yes"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("签名无效"), errors.join("\n"));
+  assert.equal(calls.length, 0);
+});
+
+test("install declines an unsigned recipe when the user answers no (P3-2)", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { pin: { allow: false } }),
+  });
+  const { calls, runner } = fakeRunner();
+  const { io } = captureIo({ runner, ask: async () => "n" }); // interactive, says no
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 0);
+  assert.equal(calls.length, 0);
+  const state = await readState();
+  assert.ok(!state.packages["app"]);
+});
+
+// -------------------------------------------------- key management (P3-2)
+
+test("key add/list/remove manage the trusted-key set", async (t) => {
+  await makeEnv(t);
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const raw = Buffer.from(publicKey.export({ format: "jwk" }).x, "base64url");
+  const keyId = "0f1e2d3c4b5a6978";
+  const pubFile = join(tmpdir(), `dshpkg-test-key-${Date.now()}.pub`);
+  await writeFile(
+    pubFile,
+    `untrusted comment: minisign public key ${keyId}\n` +
+      Buffer.concat([Buffer.from([0x45, 0x64]), Buffer.from(keyId, "hex"), raw]).toString("base64"),
+    "utf8",
+  );
+  const { io, logs } = captureIo();
+  assert.equal(await runCli(["key", "add", pubFile, "my key"], io), 0);
+  assert.ok(logs.join("\n").includes(keyId));
+  assert.equal(await runCli(["key", "list"], io), 0);
+  assert.ok(logs.join("\n").includes("my key"));
+  assert.equal(await runCli(["key", "remove", keyId], io), 0);
+  const { readTrustedKeys } = await import("../lib/state.js");
+  assert.equal((await readTrustedKeys()).keys.length, 0);
+});
+
+test("key add rejects a garbage public key", async (t) => {
+  await makeEnv(t);
+  const { io, errors } = captureIo();
+  const code = await runCli(["key", "add", "definitely-not-a-key"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("公钥"), errors.join("\n"));
+});
+
+// ------------------------------------------------ self-upgrade (P4-2)
+
+test("self-upgrade snapshots, applies, smokes and reports success (P4-2)", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 0 };
+  };
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["self-upgrade"], io);
+  assert.equal(code, 0);
+  assert.deepEqual(calls[0], ["add", "-g", "dshpkg@latest"]);
+  assert.deepEqual(calls[1], ["help"]);
+  assert.ok(logs.join("\n").includes("已升级"));
+  assert.equal((await readdir(statePath("snapshots"))).length, 1);
+});
+
+test("self-upgrade rolls back to the previous version when smoke fails (P4-2)", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: args[0] === "help" ? 1 : 0, stderr: args[0] === "help" ? "crash" : "" };
+  };
+  const { io, errors } = captureIo({ runner });
+  const code = await runCli(["self-upgrade"], io);
+  assert.equal(code, 1);
+  assert.deepEqual(calls[1], ["help"]);
+  assert.deepEqual(calls[2], ["add", "-g", "dshpkg@0.1.0"]); // rollback to current
+  assert.ok(errors.join("\n").includes("回退"), errors.join("\n"));
+});
+
+test("self-upgrade reports a failed apply without rolling back (P4-2)", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 1, stderr: "boom" };
+  };
+  const { io, errors } = captureIo({ runner });
+  const code = await runCli(["self-upgrade"], io);
+  assert.equal(code, 1);
+  assert.equal(calls.length, 1);
+  assert.ok(errors.join("\n").includes("升级失败"), errors.join("\n"));
+});
+
+// ------------------------------------------------------ daemon (P4-1)
+
+test("daemon install registers the scheduled task via schtasks (P4-1)", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 0 };
+  };
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["daemon", "install"], io);
+  assert.equal(code, 0);
+  assert.equal(calls[0][0], "schtasks");
+  assert.ok(calls[0].includes("/Create"), calls[0].join(" "));
+  assert.ok(calls[0].includes("dshpkg-supervisor"));
+  assert.ok(calls[0].includes("/SC") && calls[0].includes("MINUTE"));
+  assert.ok(logs.join("\n").includes("已注册计划任务"));
+});
+
+test("daemon status reflects the task registration (P4-1)", async (t) => {
+  await makeEnv(t);
+  const { io } = captureIo({ runner: () => ({ status: 0 }) });
+  assert.equal(await runCli(["daemon", "status"], io), 0);
+  const { io: io2 } = captureIo({ runner: () => ({ status: 1 }) });
+  assert.equal(await runCli(["daemon", "status"], io2), 1);
 });
 
 test("install a local path probes package.json and adds link: prefixed", async (t) => {
@@ -732,6 +970,21 @@ test("hold on an unknown package exits 1", async (t) => {
   assert.ok(errors.join("\n").includes("未找到已安装插件"));
 });
 
+test("hold refuses dangerous package names (prototype-pollution guard)", async (t) => {
+  await makeEnv(t);
+  const { io, errors } = captureIo();
+  for (const bad of ["__proto__", "constructor", "prototype"]) {
+    const code = await runCli(["hold", bad], io);
+    assert.equal(code, 1, bad);
+    assert.ok(errors.join("\n").includes("非法的插件名"), bad);
+  }
+  // state.packages gained no own property for the dangerous keys.
+  const state = await readState();
+  for (const bad of ["__proto__", "constructor", "prototype"]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(state.packages, bad), false, bad);
+  }
+});
+
 // -------------------------------------------------------- enable / disable
 
 test("disable writes a managed block into cordis.patch.yml (file mode)", async (t) => {
@@ -1061,6 +1314,31 @@ test("repo add rejects unsafe urls", async (t) => {
   assert.ok(errors.join("\n").includes("仓库地址不能包含"));
 });
 
+test("repo init adds the default repos from the env override (R5)", async (t) => {
+  await makeEnv(t);
+  const prev = process.env.DSH_DEFAULT_REPOS;
+  process.env.DSH_DEFAULT_REPOS = JSON.stringify([
+    { url: "https://example.com/community.git", name: "community", format: "git" },
+  ]);
+  t.after(() => {
+    if (prev === undefined) delete process.env.DSH_DEFAULT_REPOS;
+    else process.env.DSH_DEFAULT_REPOS = prev;
+  });
+  const { io, logs } = captureIo();
+  assert.equal(await runCli(["repo", "init"], io), 0);
+  assert.ok(logs.join("\n").includes("已添加 1 个默认仓库"));
+  const repos = JSON.parse(await readFile(statePath("repos.json"), "utf8"));
+  assert.equal(repos.repos.length, 1);
+  assert.equal(repos.repos[0].name, "community");
+});
+
+test("repo init --no-default writes nothing", async (t) => {
+  await makeEnv(t);
+  const { io } = captureIo();
+  assert.equal(await runCli(["repo", "init", "--no-default"], io), 0);
+  assert.equal(existsSync(statePath("repos.json")), false);
+});
+
 // ------------------------------------------------------------------- update
 
 test("update skips a fresh index (24h) and reports it", async (t) => {
@@ -1186,6 +1464,36 @@ test("host probe respects --port when choosing the HTTP target", async (t) => {
   await runCli(["status", "x", "--port", "9999"], io);
   assert.ok(seen.every((u) => u.includes("9999")));
   assert.ok(!seen.some((u) => u.includes(String(HOST_PORT))));
+});
+
+test("every host request carries the x-dshpkg-token matching the api-token file", async (t) => {
+  await makeEnv(t);
+  const seen = [];
+  const posts = [];
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), headers: init.headers ?? {} });
+    if (String(url).endsWith("/dshpkg/status")) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, managed: [] }) };
+    }
+    if (init.method === "POST") {
+      posts.push({ url: String(url), body: init.body ? JSON.parse(init.body) : {} });
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const { io, logs } = captureIo({ fetcher });
+  const code = await runCli(["disable", "dsh-plugin-x"], io);
+  assert.equal(code, 0);
+  // token generated lazily under the isolated DSH_PKG_HOME
+  const token = (await readFile(statePath("api-token"), "utf8")).trim();
+  assert.ok(token.length >= 32, "a 32-byte hex token was written");
+  // the probe (GET) and the write (POST) both carried the token
+  assert.ok(seen.length >= 2, "probe + POST both hit the host");
+  for (const call of seen) {
+    assert.equal(call.headers["x-dshpkg-token"], token);
+  }
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].body, { name: "dsh-plugin-x" });
 });
 
 // -------------------------------------------------------- dsh launcher

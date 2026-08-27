@@ -9,6 +9,7 @@ import {
   removeManagedBlock,
   rescueHtml,
   escapeHtml,
+  yamlSafeId,
 } from "../lib/rescue.js";
 
 test("buildDisableBlock produces the exact managed block format from CONTRACTS.md", () => {
@@ -16,6 +17,39 @@ test("buildDisableBlock produces the exact managed block format from CONTRACTS.m
     buildDisableBlock("boot-crash-fixture"),
     "# dshpkg:managed:start\n- id: boot-crash-fixture\n  disabled: true\n# dshpkg:managed:end\n"
   );
+});
+
+test("yamlSafeId leaves plain package-like ids unchanged", () => {
+  assert.equal(yamlSafeId("dsh-plugin-x"), "dsh-plugin-x");
+  assert.equal(yamlSafeId("boot-crash-fixture"), "boot-crash-fixture");
+  assert.equal(yamlSafeId("a.b_c-1/@x"), "a.b_c-1/@x");
+  // a leading dash or dash/question-mark start is a YAML indicator: quote it
+  assert.equal(yamlSafeId("-leading"), "'-leading'");
+  assert.equal(yamlSafeId("?strange"), "'?strange'");
+});
+
+test("yamlSafeId quotes and escapes ids with quotes / colons / newlines", () => {
+  assert.equal(yamlSafeId("it's"), "'it''s'");
+  assert.equal(yamlSafeId("a:b"), "'a:b'");
+  assert.equal(yamlSafeId("a'b:c\nd"), "'a''b:c\nd'"); // ' escaped, newline stays inside the scalar
+});
+
+test("buildDisableBlock neutralizes a malicious entry id (no injectable YAML line)", () => {
+  // A hostile id carrying a quote, a colon and a newline that, in the old
+  // `- id: ${entryId}` form, would break out and emit extra YAML directives.
+  const evil = "a'b:c\nd";
+  const block = buildDisableBlock(evil);
+  // Exactly one "- id:" and one "disabled: true" — the hostile payload lives
+  // INSIDE a single quoted scalar, not as new YAML structure.
+  assert.equal((block.match(/^- id: /gm) ?? []).length, 1);
+  assert.equal((block.match(/disabled: true/g) ?? []).length, 1);
+  const idLine = block.split("\n").find((l) => l.startsWith("- id: "));
+  assert.ok(idLine.startsWith("- id: '"));
+  // The quoted form round-trips through the match/remove helpers.
+  assert.equal(hasManagedBlock(block, evil), true);
+  assert.equal(removeManagedBlock(block, evil), "[]\n");
+  // And a plain (safe) id still emits the exact CONTRACTS format.
+  assert.equal(buildDisableBlock("plain-id"), "# dshpkg:managed:start\n- id: plain-id\n  disabled: true\n# dshpkg:managed:end\n");
 });
 
 test("applyDisableToPatch appends the block to an empty patch", () => {

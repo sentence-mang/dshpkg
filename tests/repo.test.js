@@ -4,10 +4,13 @@
 
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename, resolve } from "node:path";
-import { repoAdd, repoRemove, repoList, syncRepos, loadAllRecipes } from "../lib/repo.js";
+import { repoAdd, repoRemove, repoList, syncRepos, loadAllRecipes, repoInit, autoPoll, autoPollDue } from "../lib/repo.js";
+import { readState, writeState, readIncidents, statePath } from "../lib/state.js";
+import { SOURCES } from "../lib/indexer.js";
 
 let home;
 
@@ -91,6 +94,26 @@ test("repoAdd rejects urls/names with spaces or quotes", async () => {
   await assert.rejects(() => repoAdd("https://example.com/ok.git", ""), /不能为空/);
 });
 
+test("repoAdd rejects a repo url starting with a dash (git option injection)", async () => {
+  // A dash-prefixed url with no other forbidden chars reaches the leading-dash
+  // guard (a spacey "-u https://…" would already trip the whitespace guard).
+  await assert.rejects(() => repoAdd("--upload-pack=evil", "evil"), /不能以 - 开头/);
+  await assert.rejects(() => repoAdd("-u", "evil"), /不能以 - 开头/);
+});
+
+test("repoAdd rejects names that are not package-like (traversal, separators, leading dot/dash)", async () => {
+  for (const bad of ["..", "../x", "a/b", "a\\b", ".hidden", "-flag", "a:b"]) {
+    await assert.rejects(
+      () => repoAdd("https://example.com/ok.git", bad),
+      /仓库名称不合法/,
+      bad,
+    );
+  }
+  // Derived names follow the same whitelist rule.
+  await assert.rejects(() => repoAdd("https://example.com/-evil.git"), /仓库名称不合法/);
+  await assert.rejects(() => repoAdd("https://example.com/.hidden.git"), /仓库名称不合法/);
+});
+
 test("repoRemove removes by name; unknown name throws", async () => {
   await repoAdd("https://example.com/a.git", "one");
   await repoAdd("https://example.com/b.git", "two");
@@ -99,6 +122,9 @@ test("repoRemove removes by name; unknown name throws", async () => {
   assert.equal(list.length, 1);
   assert.equal(list[0].name, "two");
   await assert.rejects(() => repoRemove("nope"), /不存在/);
+  // The name whitelist applies on remove too (alignment with repoAdd).
+  await assert.rejects(() => repoRemove("../x"), /仓库名称不合法/);
+  await assert.rejects(() => repoRemove("a/b"), /仓库名称不合法/);
 });
 
 // ---------- syncRepos ----------
@@ -120,6 +146,8 @@ test("syncRepos clones enabled repos and skips disabled ones", async () => {
   assert.equal(runner.calls.length, 1);
   assert.equal(runner.calls[0].args[0], "clone");
   assert.equal(runner.calls[0].args[1], "--depth");
+  // the "--" separator guarantees url/dest can never parse as git options
+  assert.equal(runner.calls[0].args[3], "--");
   // clone dest is <stateRoot>/recipes/<name> (state root is the temp dir)
   assert.equal(resolve(runner.calls[0].args.at(-1)), join(home, "recipes", "high"));
   // checkout materialized on disk
@@ -147,6 +175,31 @@ test("syncRepos fetches and resets existing checkouts", async () => {
   assert.equal(second.calls[1].args[2], "origin/HEAD");
 });
 
+test("syncRepos copies pubkeys/*.pub into the shared cache (P3-1)", async () => {
+  await repoAdd("https://example.com/pk.git", "pk");
+  const runner = fakeRunner({
+    pk: {
+      "index.json": { recipes: [] },
+      "pubkeys/0102030405060708.pub":
+        "untrusted comment: test key\nRWRBQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n",
+    },
+  });
+  const outcomes = await syncRepos({ runner: runner.run });
+  assert.equal(outcomes[0].status, "ok");
+  const cached = await readFile(
+    join(home, "pubkeys", "0102030405060708.pub"),
+    "utf8",
+  );
+  assert.ok(cached.includes("RWR"), "pubkey cached verbatim");
+});
+
+test("syncRepos tolerates repos without a pubkeys/ directory", async () => {
+  await repoAdd("https://example.com/plain.git", "plain");
+  const runner = fakeRunner({ plain: { "index.json": { recipes: [] } } });
+  const outcomes = await syncRepos({ runner: runner.run });
+  assert.equal(outcomes[0].status, "ok");
+});
+
 test("syncRepos reports per-repo failures without throwing", async () => {
   await repoAdd("https://example.com/broken.git", "broken");
   await repoAdd("https://example.com/ok.git", "ok");
@@ -157,6 +210,271 @@ test("syncRepos reports per-repo failures without throwing", async () => {
   assert.equal(broken.status, "error");
   assert.ok(broken.error.includes("不存在"));
   assert.equal(outcomes.find((o) => o.name === "ok").status, "ok");
+});
+
+test("syncRepos re-validates tampered repos.json entries (name/url) per-repo", async () => {
+  await repoAdd("https://example.com/good.git", "good");
+  await repoAdd("https://example.com/evil.git", "evil");
+  // On-disk tamper that bypassed repoAdd(): a traversal name and a url that
+  // git would parse as an option. The re-validation must reject both.
+  const config = await readReposFile();
+  config.repos[1].name = "../evil";
+  config.repos[1].url = "-u malicious";
+  await writeFile(join(home, "repos.json"), JSON.stringify(config));
+
+  const runner = fakeRunner({ good: { "index.json": { recipes: [] } } });
+  const outcomes = await syncRepos({ runner: runner.run });
+
+  assert.equal(outcomes.length, 2);
+  const evil = outcomes.find((o) => o.name === "../evil");
+  assert.equal(evil.status, "error");
+  assert.ok(evil.error.includes("仓库名称不合法"), evil.error);
+  assert.equal(outcomes.find((o) => o.name === "good").status, "ok");
+  // The evil entry never reached git: only the good repo was cloned.
+  assert.equal(runner.calls.length, 1);
+  assert.ok(runner.calls[0].args.at(-1).endsWith("good"));
+});
+
+// ---------- static index sources (R2, design §2) ----------
+
+/** Fake HTTP fetcher: url -> payload object (or a function returning it).
+ * Supports both json() and text() consumers (indexer + repo index sources). */
+function fakeFetcher(routes = {}) {
+  const calls = [];
+  const fetcher = async (url) => {
+    calls.push(String(url));
+    const route = routes[String(url)];
+    if (route === undefined) {
+      return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+    }
+    if (typeof route === "function") return route();
+    return {
+      ok: true,
+      status: 200,
+      json: async () => (typeof route === "string" ? { items: [] } : route),
+      text: async () => (typeof route === "string" ? route : JSON.stringify(route)),
+    };
+  };
+  return { fetcher, calls };
+}
+
+test("repoAdd rejects an unknown format", async () => {
+  await assert.rejects(
+    () => repoAdd("https://example.com/x.json", "x", "zip"),
+    /仓库格式/,
+  );
+});
+
+test("repoAdd persists the index format on the entry", async () => {
+  const entry = await repoAdd("https://example.com/awesome.json", "awesome", "index");
+  assert.equal(entry.format, "index");
+  const config = await readReposFile();
+  assert.equal(config.repos[0].format, "index");
+});
+
+test("syncRepos fetches and caches a static index source", async () => {
+  await repoAdd("https://example.com/awesome.json", "awesome", "index");
+  const { fetcher, calls } = fakeFetcher({
+    "https://example.com/awesome.json": {
+      format: "dshpkg-index/v1",
+      plugins: [makeRecipe("alpha", "alpha@1.0.0")],
+    },
+  });
+  const outcomes = await syncRepos({ fetcher });
+  assert.deepEqual(outcomes, [{ name: "awesome", status: "ok", format: "index" }]);
+  assert.equal(calls.length, 1);
+  const cached = JSON.parse(
+    await readFile(join(home, "sources", "awesome", "index.json"), "utf8"),
+  );
+  assert.equal(cached.plugins.length, 1);
+});
+
+test("syncRepos reports a broken/offline index source per-repo", async () => {
+  await repoAdd("https://example.com/down.json", "down", "index");
+  const { fetcher } = fakeFetcher({}); // 404 for everything
+  const outcomes = await syncRepos({ fetcher });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "error");
+  assert.ok(outcomes[0].error.includes("HTTP 404"), outcomes[0].error);
+});
+
+test("syncRepos rejects a wrong-shaped index payload per-repo", async () => {
+  await repoAdd("https://example.com/bad.json", "bad", "index");
+  const { fetcher } = fakeFetcher({
+    "https://example.com/bad.json": { format: "other/v2", plugins: [] },
+  });
+  const outcomes = await syncRepos({ fetcher });
+  assert.equal(outcomes[0].status, "error");
+  assert.ok(outcomes[0].error.includes("未知的索引格式"), outcomes[0].error);
+});
+
+test("loadAllRecipes reads recipes from a cached static index", async () => {
+  await repoAdd("https://example.com/awesome.json", "awesome", "index");
+  await mkdir(join(home, "sources", "awesome"), { recursive: true });
+  await writeFile(
+    join(home, "sources", "awesome", "index.json"),
+    JSON.stringify({
+      format: "dshpkg-index/v1",
+      plugins: [makeRecipe("alpha", "alpha@1.0.0"), { kind: "nope" }], // invalid skipped
+    }),
+  );
+  const recipes = await loadAllRecipes();
+  assert.deepEqual(recipes.map((r) => r.recipe.name), ["alpha"]);
+  assert.equal(recipes[0].origin, "awesome");
+});
+
+// ---------- repoInit (R5, design §3) ----------
+
+test("repoInit adds the default repos on first use (env-overridable)", async () => {
+  const prev = process.env.DSH_DEFAULT_REPOS;
+  process.env.DSH_DEFAULT_REPOS = JSON.stringify([
+    { url: "https://example.com/community.git", name: "community", format: "git" },
+    { url: "https://example.com/idx.json", name: "idx", format: "index" },
+  ]);
+  try {
+    const result = await repoInit();
+    assert.deepEqual(result, { added: 2, skipped: false });
+    const config = await readReposFile();
+    assert.equal(config.repos.length, 2);
+    assert.equal(config.repos[1].format, "index");
+    // idempotent: a second init skips
+    const again = await repoInit();
+    assert.deepEqual(again, { added: 0, skipped: true });
+  } finally {
+    if (prev === undefined) delete process.env.DSH_DEFAULT_REPOS;
+    else process.env.DSH_DEFAULT_REPOS = prev;
+  }
+});
+
+test("repoInit with noDefault writes nothing", async () => {
+  const result = await repoInit({ noDefault: true });
+  assert.deepEqual(result, { added: 0, skipped: true });
+  assert.equal(existsSync(join(home, "repos.json")), false);
+});
+
+// ---------- autoPoll (P2-4, design §4) ----------
+
+/** Make the repos.json lastSyncAt 25h old (overdue for the 24h interval). */
+async function makeOverdue() {
+  const cfg = await readReposFile();
+  await writeFile(
+    join(home, "repos.json"),
+    JSON.stringify({
+      ...cfg,
+      lastSyncAt: new Date(Date.now() - 25 * 3600_000).toISOString(),
+    }),
+  );
+}
+
+/** All three index sources answer empty (keeps refreshIndex offline-green). */
+function emptyIndexFetcher() {
+  return fakeFetcher({
+    [SOURCES.github]: { items: [] },
+    [SOURCES.npm]: { objects: [] },
+    [SOURCES.awesome]: "# none\n",
+  });
+}
+
+test("autoPollDue respects repo emptiness, freshness, backoff, disable and suspend", async () => {
+  assert.deepEqual(await autoPollDue(), { due: false, reason: "no-repos" });
+  await repoAdd("https://example.com/a.git", "a");
+  const runner = fakeRunner({ a: { "index.json": { recipes: [] } } });
+  await syncRepos({ runner: runner.run }); // lastSyncAt = now -> fresh
+  assert.equal((await autoPollDue()).reason, "fresh");
+
+  // Backoff semantics: 1h base interval, lastSyncAt 1.5h ago.
+  const cfg = await readReposFile();
+  const lastSync1hAgo = JSON.stringify({
+    ...cfg,
+    lastSyncAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+  });
+  await writeFile(join(home, "repos.json"), lastSync1hAgo);
+  await writeState({ pollIntervalMs: 3600_000, pollFailures: 0 });
+  assert.equal((await autoPollDue()).reason, "overdue"); // 1.5h > 1h base
+  await writeState({ pollIntervalMs: 3600_000, pollFailures: 1 });
+  assert.equal((await autoPollDue()).reason, "fresh"); // 1.5h < 2h backoff
+
+  // The 24h cap bounds the backoff: 25h-old data is overdue even with 10
+  // recorded failures (uncapped it would be a 1024h window).
+  await writeFile(
+    join(home, "repos.json"),
+    JSON.stringify({
+      ...cfg,
+      lastSyncAt: new Date(Date.now() - 25 * 3600_000).toISOString(),
+    }),
+  );
+  await writeState({ pollIntervalMs: 3600_000, pollFailures: 10 });
+  assert.equal((await autoPollDue()).reason, "overdue");
+
+  await writeState({ pollFailures: 0, pollIntervalMs: 0 });
+  assert.deepEqual(await autoPollDue(), { due: false, reason: "disabled" });
+  await writeState({
+    pollFailures: 0,
+    pollIntervalMs: undefined,
+    pollSuspendedAt: new Date().toISOString(),
+  });
+  assert.deepEqual(await autoPollDue(), { due: false, reason: "suspended" });
+});
+
+test("autoPoll runs an overdue sync, refreshes lastSyncAt and resets failures", async () => {
+  await repoAdd("https://example.com/a.git", "a");
+  await makeOverdue();
+  await writeState({ pollFailures: 2 });
+
+  const runner = fakeRunner({ a: { "index.json": { recipes: [] } } });
+  const { fetcher, calls } = emptyIndexFetcher();
+  const result = await autoPoll({ fetcher, runner: runner.run });
+  assert.equal(result.ran, true);
+  assert.equal(result.ok, true);
+  // git clone ran and the index sources were fetched (locked, exclusive)
+  assert.equal(runner.calls.length, 1);
+  assert.equal(calls.length, 3);
+  // success resets the failure counter and refreshes freshness
+  assert.equal((await readState()).pollFailures, 0);
+  assert.equal((await autoPollDue()).reason, "fresh");
+  // the lock was released
+  assert.equal(existsSync(statePath("sync.lock")), false);
+});
+
+test("autoPoll backs off, suspends after three failures and records incidents", async () => {
+  await repoAdd("https://example.com/a.git", "a");
+  await makeOverdue();
+  await writeState({ pollFailures: 0 });
+
+  const broken = fakeFetcher({}); // every network call 404s
+  for (let i = 0; i < 3; i += 1) {
+    // Push lastSyncAt to the epoch between attempts: the growing backoff
+    // window would otherwise make the retry look "fresh".
+    const cfg = await readReposFile();
+    await writeFile(
+      join(home, "repos.json"),
+      JSON.stringify({ ...cfg, lastSyncAt: "1970-01-01T00:00:00.000Z" }),
+    );
+    const result = await autoPoll({ fetcher: broken.fetcher });
+    assert.equal(result.ran, true, `attempt ${i + 1}`);
+    assert.equal(result.ok, false);
+  }
+  const state = await readState();
+  assert.equal(state.pollFailures, 3);
+  assert.ok(state.pollSuspendedAt, "polling suspends after 3 failures");
+  assert.deepEqual(await autoPollDue(), { due: false, reason: "suspended" });
+  // one poll-failed incident per failure
+  const incidents = await readIncidents(10);
+  assert.equal(incidents.filter((i) => i.type === "poll-failed").length, 3);
+});
+
+test("autoPoll skips when the lock is held by another caller", async () => {
+  await repoAdd("https://example.com/a.git", "a");
+  await makeOverdue();
+  const { acquireSyncLock } = await import("../lib/state.js");
+  await acquireSyncLock();
+  try {
+    const result = await autoPoll({ fetcher: emptyIndexFetcher().fetcher });
+    assert.deepEqual(result, { ran: false, ok: null, reason: "locked" });
+  } finally {
+    const { releaseSyncLock } = await import("../lib/state.js");
+    await releaseSyncLock();
+  }
 });
 
 // ---------- loadAllRecipes ----------

@@ -99,15 +99,16 @@ dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
 
-## CLI 命令（21 个）
+## CLI 命令（29 个命令入口）
 
 | 命令 | 说明 |
 | --- | --- |
 | `search <关键词>` | 搜索插件（本地索引；`--online` 联网 GitHub/npm） |
-| `install <名称>` | 事务安装：闭包→预检→安装→冒烟，失败自动回滚 |
+| `install <名称>` | 事务安装：闭包→预检→信任闸门→安装→冒烟，失败自动回滚 |
 | `remove <名称>` | 卸载插件 |
 | `update` / `sync` | 同步配方仓库并刷新插件索引（apt update 语义） |
 | `upgrade [名称]` | 升级全部或指定插件到最新版本 |
+| `self-upgrade [版本]` | 事务化升级 dshpkg 自身（快照 + 冒烟，失败自动回退） |
 | `hold <名称>` | 保持当前版本（upgrade 跳过它） |
 | `unhold <名称>` | 取消保持 |
 | `enable <名称>` | 启用插件（移除 cordis.patch.yml 禁用块） |
@@ -121,10 +122,23 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 | `fix-broken` | 交互式修复 circuit-open 的插件 |
 | `log` | 输出崩溃事件流（incidents.jsonl） |
 | `run` | 启动看门狗守护 dsh（`--port N` / `--profile 名`） |
-| `repo add/remove/list` | 添加 / 移除 / 列出配方仓库 |
+| `daemon install/uninstall/status` | 注册/注销/查询看门狗计划任务（Windows 计划任务，每 5 分钟拉起） |
+| `repo init [--no-default]` | 首次使用：一键添加默认社区仓库 |
+| `repo add <url> [名称] [--format git\|index]` | 添加配方仓库（`--format index` = 发布者静态索引源） |
+| `repo remove/list` | 移除 / 列出配方仓库 |
+| `key add/list/remove` | 信任 / 列出 / 移除 minisign 公钥（配方签名验签） |
 | `help` | 显示帮助 |
 
-常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`。
+常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`、`--yes`（非交互确认）。
+
+## 配方签名与信任（minisign）
+
+配方可携带 `signatures.minisign`（Ed25519，一期；SSH 槽位预留）。验签基于**发布原文的 canonical JSON**（键序排序、无空白），与 `validateRecipe` 的默认填充无关：
+
+- 签名有效且公钥可信 → `install` 自动放行（展示 ✓）；
+- 签名无效 → **拒绝安装**（`--yes` 也不放行，fail-closed）；
+- 未签名 → 交互确认（回车=确认）或 `--yes`；`pin.allow` 的配方按仓库级信任提示后放行；
+- 公钥来源：仓库 `pubkeys/<keyId>.pub`（sync 时缓存）或 `dshpkg key add` 显式信任集。
 
 ## 自愈机制（三层熔断）
 

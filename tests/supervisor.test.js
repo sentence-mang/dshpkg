@@ -10,6 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +26,14 @@ import {
   readPatchTopLevel,
   writeManagedDisable,
   removeManagedBlock,
+  eventToIncident,
+  persistCrash,
+  persistCircuitOpen,
+  selectSnapshotToRestore,
+  resetToFactoryBaseline,
+  lockfileHashOf,
 } from "../bin/supervisor.js";
+import { readState, writeState } from "../lib/state.js";
 
 // Exact verified message from the Phase 0 PoC (CONTRACTS.md).
 const EXACT_CRASH_TEXT =
@@ -625,6 +633,229 @@ test("removeManagedBlock: restores a bare [] after removing the only block", asy
   const removed = await removeManagedBlock(dir);
   assert.equal(removed, 1);
   assert.equal(await readFile(join(dir, "cordis.patch.yml"), "utf8"), "[]\n");
+});
+
+// --- Phase 1 wiring: incidents, crash bookkeeping, snapshots ----------------
+
+test("eventToIncident flattens supervise events into incident records", () => {
+  assert.deepEqual(
+    eventToIncident(
+      { type: "healthy", detail: { port: 3080, profile: "web" } },
+      { profile: "web", port: 3080 },
+    ),
+    { type: "healthy", port: 3080, profile: "web" },
+  );
+  assert.deepEqual(
+    eventToIncident({ type: "boot-failed", detail: { code: 1, entryId: "x", detail: "boom" } }),
+    { type: "boot-failed", code: 1, entryId: "x", detail: "boom", profile: null, port: null },
+  );
+  assert.deepEqual(
+    eventToIncident({ type: "restarting", detail: { attempt: 2 } }, { profile: "web" }),
+    { type: "restarting", attempt: 2, profile: "web", port: null },
+  );
+});
+
+test("persistCrash records crashes into state.json and opens the circuit (P1-2)", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  await persistCrash("boot-crash-fixture");
+  let state = await readState();
+  assert.equal(state.packages["boot-crash-fixture"].crashCount, 1);
+  assert.equal(state.packages["boot-crash-fixture"].crashTimes.length, 1);
+
+  await persistCrash("boot-crash-fixture");
+  await persistCrash("boot-crash-fixture");
+  state = await readState();
+  // the third crash inside the window opens the circuit
+  assert.equal(state.packages["boot-crash-fixture"].crashCount, 3);
+  assert.equal(typeof state.packages["boot-crash-fixture"].circuitOpenAt, "number");
+
+  // dangerous keys never touch Object.prototype
+  await persistCrash("__proto__");
+  assert.equal(Object.prototype.hasOwnProperty.call(state.packages, "__proto__"), false);
+});
+
+test("persistCircuitOpen marks the circuit open in state.json (P1-2)", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  await persistCircuitOpen("boot-crash-fixture");
+  let state = await readState();
+  assert.equal(typeof state.packages["boot-crash-fixture"].circuitOpenAt, "number");
+  assert.equal(state.packages["boot-crash-fixture"].crashCount, 3);
+
+  // an already-open circuit keeps its marker
+  await persistCircuitOpen("boot-crash-fixture");
+  state = await readState();
+  assert.equal(typeof state.packages["boot-crash-fixture"].circuitOpenAt, "number");
+
+  // dangerous keys never touch Object.prototype
+  await persistCircuitOpen("__proto__");
+  assert.equal(Object.prototype.hasOwnProperty.call(state.packages, "__proto__"), false);
+});
+
+test("supervise: healthy wires incident + snapshot side effects (P1-1+P1-3)", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  // Injected sinks prove the loop calls the wiring functions with the right
+  // payloads; the real writers (appendIncident / saveSnapshot) are covered
+  // by their own unit tests (state.test.js / snapshot.test.js).
+  // The watchdog is stopped by the child's CLEAN EXIT (code 0) instead of
+  // SIGINT: the sandbox test runner treats a synthetic SIGINT as an abort
+  // signal and cancels every following test.
+  const incidents = [];
+  const snapshots = [];
+  const children = [];
+  const events = [];
+  const run = supervise({
+    profile: "web",
+    onEvent: (e) => events.push(e),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+    incidentImpl: async (rec) => incidents.push(rec),
+    // The snapshot trigger is the first awaited point after healthy: exit the
+    // child cleanly there so the loop ends deterministically.
+    snapshotImpl: async (dir) => {
+      snapshots.push(dir);
+      children[0]?.emit("exit", 0, null);
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  await run;
+
+  // P1-1: the healthy event was handed to the incident writer (flat record).
+  assert.equal(incidents.length, 1);
+  assert.deepEqual(incidents[0], { type: "healthy", port: 3080, profile: "web" });
+  // P1-3 trigger ②: the known-good profile dir was handed to the snapshotter.
+  assert.deepEqual(snapshots, [profileDir]);
+});
+
+test("supervise: healthy idle window re-invokes the poll hook (P2-4 wiring)", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  // The first poll "runs" (loop re-checks), the second one emits a clean
+  // child exit (code 0) so the watchdog stops deterministically — no SIGINT
+  // (the sandbox runner treats a synthetic SIGINT as an abort signal).
+  const polls = [];
+  const children = [];
+  const events = [];
+  const run = supervise({
+    profile: "web",
+    onEvent: (e) => events.push(e),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+    incidentImpl: async () => {},
+    snapshotImpl: async () => {},
+    pollImpl: async () => {
+      polls.push(1);
+      if (polls.length === 2) children[0]?.emit("exit", 0, null);
+      return { ran: polls.length === 1 };
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  await run;
+
+  // The hook ran once per idle-window wake-up: the first returned "ran" and
+  // the loop re-checked (second call), then the clean exit stopped the loop.
+  assert.equal(polls.length, 2);
+});
+
+// --- P3-4: unattributable-failure fallbacks ---------------------------------
+
+test("selectSnapshotToRestore walks the chain newest-first, skipping tried ones", () => {
+  const snaps = ["c", "b", "a"]; // newest first (listSnapshots convention)
+  assert.equal(selectSnapshotToRestore(snaps, []), "c");
+  assert.equal(selectSnapshotToRestore(snaps, ["c"]), "b");
+  assert.equal(selectSnapshotToRestore(snaps, ["c", "b"]), "a");
+  assert.equal(selectSnapshotToRestore(snaps, ["c", "b", "a"]), null);
+  assert.equal(selectSnapshotToRestore([], []), null);
+});
+
+test("resetToFactoryBaseline removes managed blocks and keeps user content", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+  await writeFile(
+    join(profileDir, "cordis.patch.yml"),
+    "# dshpkg:managed:start\n- id: x\n  disabled: true\n# dshpkg:managed:end\n- id: user-entry\n",
+    "utf8",
+  );
+  await resetToFactoryBaseline(profileDir);
+  const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
+  assert.equal(patch.includes("dshpkg:managed"), false);
+  assert.ok(patch.includes("user-entry"), "user content untouched");
+});
+
+test("lockfileHashOf is a stable sha256 of the lockfile content", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+  await writeFile(join(profileDir, "pnpm-lock.yaml"), "lockfile v9\n", "utf8");
+  const h = await lockfileHashOf(profileDir);
+  assert.equal(h.length, 64);
+  assert.equal(h, await lockfileHashOf(profileDir));
+  await writeFile(join(profileDir, "pnpm-lock.yaml"), "lockfile v9 changed\n", "utf8");
+  assert.notEqual(h, await lockfileHashOf(profileDir));
+});
+
+test("supervise: a drifted lockfile triggers the frozen rebuild (P3-4 wiring)", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+  await writeFile(join(profileDir, "pnpm-lock.yaml"), "current lockfile\n", "utf8");
+  await writeState({
+    lockfileHash: createHash("sha256").update("known good", "utf8").digest("hex"),
+  });
+
+  const rebuilds = [];
+  const children = [];
+  const events = [];
+  const run = supervise({
+    profile: "web",
+    onEvent: (e) => events.push(e),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+    incidentImpl: async () => {},
+    snapshotImpl: async () => {},
+    pollImpl: async () => {
+      // stop the loop deterministically via a clean child exit (no SIGINT)
+      children[0]?.emit("exit", 0, null);
+      return { ran: false };
+    },
+    pnpmInstallImpl: async (dir) => {
+      rebuilds.push(dir);
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  await run;
+
+  assert.equal(rebuilds.length, 1, "drifted lockfile rebuilt exactly once");
+  assert.equal(rebuilds[0], profileDir);
+  // the known-good hash now matches the rebuilt lockfile
+  const state = await readState();
+  assert.equal(state.lockfileHash, await lockfileHashOf(profileDir));
 });
 
 // --- supervise: healthy path ------------------------------------------------

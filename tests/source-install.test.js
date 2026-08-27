@@ -103,10 +103,10 @@ test("git specs are cloned into the cache and installed via link:", async (t) =>
 
   assert.deepEqual(res, { ok: true, installed: ["dsh-plugin-src"], usedCache: true });
 
-  // the clone ran once, with --depth 1
+  // the clone ran once, with --depth 1 and a "--" option terminator before the url
   const cacheDir = join(process.env.DSH_PKG_HOME, "cache", "git", "github.com-owner-repo");
   assert.equal(git.calls.length, 1);
-  assert.deepEqual(git.calls[0].args, ["clone", "--depth", "1", "https://github.com/owner/repo.git", cacheDir]);
+  assert.deepEqual(git.calls[0].args, ["clone", "--depth", "1", "--", "https://github.com/owner/repo.git", cacheDir]);
 
   // the add step linked the pulled source, not the original git url
   const add = dsh.calls.find((c) => c[0] === "plugin" && c[3] === "add");
@@ -141,7 +141,7 @@ test("git+https specs strip the prefix and install from the cache", async (t) =>
   });
   assert.equal(res.ok, true);
   assert.equal(git.calls[0].args[0], "clone");
-  assert.equal(git.calls[0].args[3], "https://github.com/owner/repo.git");
+  assert.equal(git.calls[0].args[4], "https://github.com/owner/repo.git"); // after the "--"
   const cacheDir = join(process.env.DSH_PKG_HOME, "cache", "git", "github.com-owner-repo");
   assert.equal(dsh.calls.find((c) => c[0] === "plugin")[4], `link:${cacheDir}`);
 });
@@ -171,6 +171,24 @@ test("a missing #path: subdirectory fails with a Chinese error before any instal
   assert.match(res.error, /子目录不存在/);
   assert.match(res.error, /packages\/core/);
   assert.equal(dsh.calls.filter((c) => c[0] === "plugin").length, 0);
+});
+
+test("#path: .. segments or absolute paths are rejected (path traversal)", async (t) => {
+  await makeEnv(t);
+  for (const [spec, needle] of [
+    ["github:owner/mono#path:../..", /子目录不合法/],
+    ["github:owner/mono#path:packages/../../etc", /子目录不合法/],
+    ["github:owner/mono#path:C:\\abs\\evil", /子目录不合法/],
+  ]) {
+    const dsh = fakeDsh();
+    const git = fakeGit({ files: { "package.json": { name: "mono" } } });
+    const res = await install(spec, { runner: dsh.runner, gitRunner: git.run });
+    assert.equal(res.ok, false, spec);
+    assert.match(res.error, needle, spec);
+    // no clone, no add, no rollback ever reached
+    assert.equal(git.calls.length, 0, spec);
+    assert.equal(dsh.calls.filter((c) => c[0] === "plugin").length, 0, spec);
+  }
 });
 
 test("unsupported refs (#branch) pass through to pnpm unchanged", async (t) => {

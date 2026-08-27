@@ -198,19 +198,19 @@ const DSHSO_LOCAL_PAYLOAD = {
 
 // ---- tests ----------------------------------------------------------------
 
-test("refreshIndex aggregates four sources into the unified shape", async (t) => {
+test("refreshIndex aggregates the three network sources into the unified shape", async (t) => {
   await withTempState(t);
   const fetcher = makeFetcher({
     "api.github.com": githubPayload([GITHUB_REPO]),
     "registry.npmjs.org": npmPayload([{ package: NPM_PKG }]),
     "raw.githubusercontent.com": awesomePayload(AWESOME_README),
-    "dsh.so": dshsoPayload(DSH_SO_ITEMS),
   });
 
   const res = await refreshIndex({ force: true, fetcher });
   assert.equal(res.ok, true);
   assert.equal(res.skipped, false);
-  // 1 github + 1 npm (merged with the dsh.so entry) + 4 awesome entries
+  // 1 github + 1 npm + 4 awesome entries (the network dsh.so source is no
+  // longer fetched by default, R1)
   assert.equal(res.count, 6);
   assert.ok(res.fetchedAt);
 
@@ -229,14 +229,14 @@ test("refreshIndex aggregates four sources into the unified shape", async (t) =>
   assert.deepEqual(foo.verification, { level: "unverified", label: "未验证" });
   assert.deepEqual(foo.security, { riskLevel: "unknown", status: "unreviewed" });
 
-  // npm entry merged with the dsh.so verification entry.
+  // npm entry keeps its own (unverified) verdict — the network dsh.so source
+  // is no longer fetched by default (R1).
   const bar = items.find((i) => i.packageName === "dsh-bar");
   assert.equal(bar.ownerRepo, "other/dsh-bar");
   assert.equal(bar.latestVersion, "1.2.3");
   assert.equal(bar.key, "dsh-bar"); // key prefers packageName
-  assert.equal(bar.verification.level, "verified");
-  assert.equal(bar.security.status, "reviewed");
-  assert.equal(bar.security.riskLevel, "low");
+  assert.deepEqual(bar.verification, { level: "unverified", label: "未验证" });
+  assert.deepEqual(bar.security, { riskLevel: "unknown", status: "unreviewed" });
 
   // awesome entry: verification level + category topic.
   const pet = items.find((i) => i.ownerRepo === "zealot00/dsh-pet");
@@ -244,11 +244,11 @@ test("refreshIndex aggregates four sources into the unified shape", async (t) =>
   assert.equal(pet.verification.label, "社区精选");
   assert.ok(pet.topics.includes("🎨 UI 增强"));
 
-  // exactly the four source URLs, with UA + timeout signal, no auth header
-  assert.equal(fetcher.calls.length, 4);
+  // exactly the three default source URLs, with UA + timeout signal, no auth
+  assert.equal(fetcher.calls.length, 3);
   assert.deepEqual(
     fetcher.calls.map((c) => c.url),
-    [SOURCES.github, SOURCES.npm, SOURCES.awesome, SOURCES.dshso]
+    [SOURCES.github, SOURCES.npm, SOURCES.awesome]
   );
   for (const call of fetcher.calls) {
     assert.equal(call.opts.headers["user-agent"], USER_AGENT);

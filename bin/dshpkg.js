@@ -25,18 +25,24 @@ import {
   readIncidents,
   resolveProfileDir,
   readJson,
+  readApiToken,
+  readTrustedKeys,
+  addTrustedKey,
+  removeTrustedKey,
+  resolvePublicKey,
 } from "../lib/state.js";
 import { search } from "../lib/search.js";
 import {
   repoAdd,
   repoRemove,
   repoList,
+  repoInit,
   syncRepos,
   loadAllRecipes,
 } from "../lib/repo.js";
 import { refreshIndex, readIndex } from "../lib/indexer.js";
 import { install, remove, defaultRunner, defaultInstallRunner } from "../lib/transaction.js";
-import { isOpen, closeCircuit } from "../lib/circuit.js";
+import { isOpen, closeCircuit, isDangerousKey } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
 import { runDshSync } from "../lib/launcher.js";
 import {
@@ -44,7 +50,8 @@ import {
   applyDisableToPatch,
   removeManagedBlock,
 } from "../lib/rescue.js";
-import { recipeFromPackageJson } from "../lib/recipe.js";
+import { recipeFromPackageJson, verifyRecipeSig, parseMinisignPublicKey } from "../lib/recipe.js";
+import { saveSnapshot } from "../lib/snapshot.js";
 
 // --- constants --------------------------------------------------------------
 
@@ -134,11 +141,27 @@ function tailOf(text, n) {
 
 // --- host probing (running dshpkg L2 host on 127.0.0.1:<port>) --------------
 
+/**
+ * Read the local API token once for a host request. The token is generated on
+ * first use under the dshpkg state root (state.js readApiToken); both the
+ * read-only probe and the write POSTs carry it so the host's no-Origin gate
+ * (which requires a token) accepts the CLI.
+ */
+async function hostToken() {
+  try {
+    return await readApiToken();
+  } catch {
+    return ""; // never block the CLI on a token-store failure
+  }
+}
+
 /** GET /dshpkg/status with a 2s timeout; null when no host answers. */
 async function probeHost(ctx, port) {
   const fetcher = ctx.fetcher ?? globalThis.fetch;
+  const token = await hostToken();
   try {
     const res = await fetcher(`http://127.0.0.1:${port}/dshpkg/status`, {
+      headers: token ? { "x-dshpkg-token": token } : {},
       signal: AbortSignal.timeout(HOST_TIMEOUT_MS),
     });
     if (!res?.ok) return null;
@@ -151,10 +174,14 @@ async function probeHost(ctx, port) {
 /** POST a JSON body to a /dshpkg/* route; never throws. */
 async function hostPost(ctx, port, path, body) {
   const fetcher = ctx.fetcher ?? globalThis.fetch;
+  const token = await hostToken();
   try {
     const res = await fetcher(`http://127.0.0.1:${port}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { "x-dshpkg-token": token } : {}),
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(HOST_TIMEOUT_MS),
     });
@@ -466,6 +493,18 @@ async function cmdInstall(ctx, args, opts) {
       recordSpec = resolved.recordSpec;
     }
 
+    // P3-2: recipe-based installs pass the trust gate (signature check +
+    // confirmation card, signing.md §4-5). Direct specs (npm/git) and local
+    // paths are explicit user intent and stay ungated; --dry-run never
+    // blocks. The signature is verified against the RAW published recipe:
+    // validateRecipe's default-filling must never change the signed payload.
+    if (recipe && !opts.dryRun && !isLocalPathSpec(spec)) {
+      const entry = (await loadAllRecipes()).find((e) => e.recipe.name === name);
+      const gate = await confirmRecipeInstall(ctx, entry?.raw ?? recipe, opts);
+      if (gate === "declined") return 0;
+      if (gate === "refused") return 1;
+    }
+
     const result = await install(target, {
       profile,
       dryRun: Boolean(opts.dryRun),
@@ -480,6 +519,11 @@ async function cmdInstall(ctx, args, opts) {
     }
     // Bookkeeping: record every package this transaction installed.
     for (const installedName of result.installed) {
+      // A __proto__/constructor/prototype installedName would resolve to the
+      // shared prototype and pollute Object.prototype on the assignment below.
+      if (isDangerousKey(installedName)) {
+        throw new Error(`非法的插件名: ${installedName}`);
+      }
       const existing = state.packages?.[installedName] ?? {};
       state.packages[installedName] = {
         ...existing,
@@ -497,6 +541,15 @@ async function cmdInstall(ctx, args, opts) {
       };
     }
     await writeState(state);
+    // P1-3 trigger ①: snapshot the known-good profile right after a
+    // successful install (best-effort — a snapshot failure must not fail the
+    // install, but it is surfaced so the user knows).
+    try {
+      const profileDir = await resolveProfileDir(profile);
+      if (profileDir) await saveSnapshot(profileDir);
+    } catch (err) {
+      ctx.error(`警告: 安装成功，但保存快照失败（${err?.message ?? err}）`);
+    }
     ctx.log(`已安装 ${name}`);
     return 0;
   } catch (err) {
@@ -533,12 +586,241 @@ async function cmdRemove(ctx, args, opts) {
   }
 }
 
+/**
+ * P3-2 (signing.md §4-5): recipe trust gate. Shows the source / verification
+ * level / signature status card, then decides:
+ *   - valid + trusted key  -> auto-proceed (no prompt);
+ *   - invalid signature    -> refuse, fail-closed;
+ *   - unsigned / key-missing -> pin.allow (repo-level trust) shows a note and
+ *     proceeds; otherwise an interactive confirm (enter = yes) or --yes is
+ *     required; non-interactive without --yes refuses.
+ * Returns "proceed" | "declined" (cancel, exit 0) | "refused" (exit 1).
+ */
+async function confirmRecipeInstall(ctx, recipe, opts) {
+  const verdict = await verifyRecipeSig(recipe, { publicKeyOf: resolvePublicKey });
+  const source = recipe.source
+    ? `${recipe.source.type}:${recipe.source.spec}`
+    : "?";
+  const sigText =
+    verdict.status === "valid"
+      ? "✓ 已验证（minisign）"
+      : verdict.status === "invalid"
+        ? "✗ 签名无效（配方可能被篡改）"
+        : verdict.status === "key-missing"
+          ? "⚠ 有签名但公钥不可信/缺失"
+          : "⚠ 未签名，无法验证来源";
+  ctx.log(`来源:         ${source}`);
+  ctx.log(
+    `验证等级:     ${recipe.verify?.label ?? "?"}（风险 ${recipe.verify?.risk ?? "?"}）`,
+  );
+  ctx.log(`签名状态:     ${sigText}`);
+
+  if (verdict.status === "valid") return "proceed"; // auto-allow (card shown)
+  if (verdict.status === "invalid") {
+    ctx.error("签名无效，拒绝安装（配方可能被篡改）");
+    return "refused";
+  }
+  // unsigned / key-missing
+  if (opts.yes) return "proceed";
+  if (recipe.pin?.allow === true) {
+    // design §4.4 exception: repo-level trust — the source info above is
+    // always shown (approval ruling ②), then the install proceeds.
+    ctx.log("提示: 该配方未签名，但声明 pin.allow（仓库级信任），放行安装");
+    return "proceed";
+  }
+  if (!ctx.canPrompt) {
+    ctx.error("拒绝安装: 未签名/不可信配方在非交互环境必须使用 --yes 明确确认");
+    return "refused";
+  }
+  const answer = String(
+    await ctx.ask("该配方未签名，无法验证来源，确认安装？[Y/n] "),
+  )
+    .trim()
+    .toLowerCase();
+  if (answer === "n" || answer === "no") {
+    ctx.log("已取消");
+    return "declined";
+  }
+  return "proceed";
+}
+
+/**
+ * `dshpkg key` — manage the explicit trusted-public-key set (signing.md §3):
+ *   key add <公钥文件|URL|base64行> [标签]
+ *   key list
+ *   key remove <keyId>
+ */
+async function cmdKey(ctx, args) {
+  try {
+    const sub = String(args[0] ?? "").trim();
+    if (sub === "add") {
+      const source = String(args[1] ?? "").trim();
+      if (!source) throw new Error("用法: dshpkg key add <公钥文件|URL|base64行> [标签]");
+      let text;
+      if (/^https?:\/\//i.test(source)) {
+        const fetcher = ctx.fetcher ?? globalThis.fetch;
+        const res = await fetcher(source, { signal: AbortSignal.timeout(10_000) });
+        if (!res?.ok) throw new Error(`HTTP ${res?.status ?? "unknown"}`);
+        text = await res.text();
+      } else {
+        text = await readTextOrEmpty(source);
+        if (!text.trim()) text = source; // bare base64 line passed directly
+      }
+      const parsed = parseMinisignPublicKey(text);
+      if (!parsed.ok) throw new Error(parsed.error);
+      const label = String(args[2] ?? "").trim();
+      const base64Line = String(text)
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0 && !l.startsWith("untrusted comment:"));
+      await addTrustedKey(parsed.keyId, label, base64Line ?? "");
+      ctx.log(`已信任公钥 ${parsed.keyId}${label ? `（${label}）` : ""}`);
+      return 0;
+    }
+    if (sub === "list") {
+      const { keys } = await readTrustedKeys();
+      if (keys.length === 0) {
+        ctx.log("（信任集中暂无公钥，使用 dshpkg key add 添加）");
+        return 0;
+      }
+      ctx.log("信任的公钥:");
+      for (const k of keys) {
+        ctx.log(`  ${k.keyId}${k.label ? `  ${k.label}` : ""}（${k.addedAt ?? "?"}）`);
+      }
+      return 0;
+    }
+    if (sub === "remove") {
+      const keyId = String(args[1] ?? "").trim();
+      if (!keyId) throw new Error("用法: dshpkg key remove <keyId>");
+      await removeTrustedKey(keyId);
+      ctx.log(`已移除公钥 ${keyId}`);
+      return 0;
+    }
+    throw new Error(
+      "用法: dshpkg key add <公钥文件|URL|base64行> [标签] | key list | key remove <keyId>",
+    );
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/** Current dshpkg version from its own package.json (fallback "0.0.0"). */
+async function currentDshpkgVersion() {
+  const pkg = await readJson(
+    join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"),
+    null,
+  );
+  return typeof pkg?.version === "string" ? pkg.version : "0.0.0";
+}
+
+/**
+ * P4-2: transactional self-upgrade — snapshot the profile first, apply the
+ * new dshpkg version, smoke-test the new binary, and roll back to the
+ * previous version when the smoke test fails (the snapshot stays as an
+ * extra restore point).
+ */
+async function cmdSelfUpgrade(ctx, args, opts) {
+  try {
+    const profile = opts.profile ?? (await readState()).profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+    if (!profileDir) throw new Error(`未找到 profile "${profile}"`);
+    const target = String(args[0] ?? "latest").trim() || "latest";
+    const runner = ctx.runner ?? defaultRunner;
+    const current = await currentDshpkgVersion();
+
+    const snapshotTs = await saveSnapshot(profileDir);
+    ctx.log(`已拍恢复快照 ${snapshotTs}`);
+    ctx.log(`升级 dshpkg ${current} -> ${target}...`);
+
+    const apply = await runner(["add", "-g", `dshpkg@${target}`]);
+    if (apply.status !== 0) {
+      throw new Error(`升级失败: ${apply.stderr ?? apply.stdout ?? "未知错误"}`);
+    }
+    const smoke = await runner(["help"]);
+    if (smoke.status !== 0) {
+      const rollback = await runner(["add", "-g", `dshpkg@${current}`]);
+      if (rollback.status !== 0) {
+        ctx.error(`回退失败: 请手动执行 pnpm add -g dshpkg@${current}`);
+      }
+      throw new Error(`新版本冒烟测试失败，已回退到 ${current}`);
+    }
+    ctx.log(`dshpkg 已升级到 ${target}（冒烟通过）`);
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/**
+ * P4-1: Windows Task Scheduler integration — register a task that re-launches
+ * supervisor.ps1 every 5 minutes (the supervisor's own single-instance lock
+ * makes the schedule idempotent; a crashed watchdog is back within 5 min).
+ * schtasks runs as a plain arg array, never a shell.
+ */
+async function cmdDaemon(ctx, args, opts) {
+  try {
+    const sub = String(args[0] ?? "").trim();
+    const runner = ctx.runner ?? defaultRunner;
+    const task = "dshpkg-supervisor";
+    if (sub === "install") {
+      const profile = opts.profile ?? (await readState()).profile ?? "web";
+      const script = join(
+        dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "supervisor.ps1",
+      );
+      const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" -Profile ${profile}`;
+      const result = await runner([
+        "schtasks",
+        "/Create",
+        "/TN",
+        task,
+        "/TR",
+        cmd,
+        "/SC",
+        "MINUTE",
+        "/MO",
+        "5",
+        "/F",
+      ]);
+      if (result.status !== 0) {
+        throw new Error(`注册失败: ${result.stderr ?? result.stdout ?? "未知错误"}`);
+      }
+      ctx.log(`已注册计划任务 ${task}（每 5 分钟拉起看门狗）`);
+      return 0;
+    }
+    if (sub === "uninstall") {
+      const result = await runner(["schtasks", "/Delete", "/TN", task, "/F"]);
+      if (result.status !== 0) {
+        throw new Error(`注销失败: ${result.stderr ?? result.stdout ?? "未知错误"}`);
+      }
+      ctx.log(`已注销计划任务 ${task}`);
+      return 0;
+    }
+    if (sub === "status") {
+      const result = await runner(["schtasks", "/Query", "/TN", task]);
+      if (result.status === 0) {
+        ctx.log("看门狗计划任务已注册");
+        return 0;
+      }
+      ctx.log("看门狗计划任务未注册（运行 dshpkg daemon install 注册）");
+      return 1;
+    }
+    throw new Error("用法: dshpkg daemon install|uninstall|status");
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
 async function cmdUpdate(ctx, _args, _opts) {
   try {
     ctx.log("同步配方仓库...");
-    const outcomes = await syncRepos();
+    const outcomes = await syncRepos(ctx.fetcher ? { fetcher: ctx.fetcher } : {});
     if (outcomes.length === 0) {
-      ctx.log("  （未配置配方仓库，使用 dshpkg repo add <url> 添加）");
+      ctx.log("  （未配置配方仓库，运行 dshpkg repo init 添加默认社区仓库）");
     }
     for (const outcome of outcomes) {
       if (outcome.status === "ok") ctx.log(`  ✓ ${outcome.name}`);
@@ -614,6 +896,7 @@ async function cmdHold(ctx, args, held) {
   try {
     const name = String(args[0] ?? "").trim();
     if (!name) throw new Error("用法: dshpkg hold|unhold <名称>");
+    if (isDangerousKey(name)) throw new Error(`非法的插件名: ${name}`);
     const state = await readState();
     const pkg = state.packages?.[name];
     if (!pkg) throw new Error(`未找到已安装插件 "${name}"（先安装或检查状态）`);
@@ -756,7 +1039,11 @@ async function cmdList(ctx, _args, opts) {
       rows.push([name, version, rec?.origin ?? pkg?.source ?? "-", status]);
     }
     if (rows.length === 0) {
-      ctx.log(opts.installed ? "（未安装任何插件）" : "（配方库与本地均无插件）");
+      ctx.log(
+        opts.installed
+          ? "（未安装任何插件）"
+          : "（配方库与本地均无插件，运行 dshpkg repo init + update 拉取社区仓库）",
+      );
       return 0;
     }
     printTable(ctx, ["名称", "版本", "来源", "状态"], rows);
@@ -786,6 +1073,13 @@ async function cmdInfo(ctx, args) {
       );
       ctx.log(`依赖:         ${deps || "（无）"}`);
       ctx.log(`harness 范围: ${recipe.harnessRange ?? "*"}`);
+      if (recipe.description) ctx.log(`介绍:         ${recipe.description}`);
+      if (recipe.maintainer) ctx.log(`维护者:       ${recipe.maintainer}`);
+      if (recipe.homepage) ctx.log(`主页:         ${recipe.homepage}`);
+      ctx.log(`许可:         ${recipe.license ?? "UNKNOWN"}`);
+      if (Array.isArray(recipe.tags) && recipe.tags.length > 0) {
+        ctx.log(`标签:         ${recipe.tags.join("、")}`);
+      }
       ctx.log(`pin:          ${recipe.pin?.allow ? "允许" : "不允许"}`);
       ctx.log(
         `验证:         ${recipe.verify?.label ?? "?"}（level ${recipe.verify?.level ?? "?"}，风险 ${recipe.verify?.risk ?? "?"}）`,
@@ -1013,9 +1307,38 @@ async function cmdRun(ctx, _args, opts) {
 async function cmdRepo(ctx, args) {
   try {
     const sub = String(args[0] ?? "").trim();
+    if (sub === "init") {
+      const noDefault = args.includes("--no-default");
+      const result = await repoInit({ noDefault });
+      if (result.skipped) {
+        ctx.log(
+          noDefault
+            ? "已跳过默认仓库（--no-default）"
+            : "已有配方仓库，跳过默认添加",
+        );
+      } else {
+        ctx.log(`已添加 ${result.added} 个默认仓库（运行 dshpkg update 拉取）`);
+      }
+      return 0;
+    }
     if (sub === "add") {
-      const entry = await repoAdd(args[1], args[2]);
-      ctx.log(`已添加仓库 ${entry.name}（${entry.url}）`);
+      // Flags may appear anywhere: url [name] [--format git|index].
+      let format = "git";
+      const rest = [];
+      for (let i = 1; i < args.length; i += 1) {
+        const arg = args[i];
+        if (arg === "--format" && args[i + 1] !== undefined) {
+          format = args[++i];
+        } else if (arg.startsWith("--format=")) {
+          format = arg.slice("--format=".length);
+        } else {
+          rest.push(arg);
+        }
+      }
+      const entry = await repoAdd(rest[0], rest[1], format);
+      ctx.log(
+        `已添加仓库 ${entry.name}（${entry.url}${entry.format === "index" ? "，静态索引源" : ""}）`,
+      );
       return 0;
     }
     if (sub === "remove") {
@@ -1026,16 +1349,20 @@ async function cmdRepo(ctx, args) {
     if (sub === "list") {
       const repos = await repoList();
       if (repos.length === 0) {
-        ctx.log("（未配置任何配方仓库，使用 dshpkg repo add <url> 添加）");
+        ctx.log("（未配置任何配方仓库，运行 dshpkg repo init 添加默认社区仓库）");
         return 0;
       }
       ctx.log("仓库列表（优先级从上到下）:");
       for (const repo of repos) {
-        ctx.log(`  ${repo.enabled === false ? "✗" : "✓"} ${repo.name}  ${repo.url}`);
+        ctx.log(
+          `  ${repo.enabled === false ? "✗" : "✓"} ${repo.name}  ${repo.url}${repo.format === "index" ? "  [index]" : ""}`,
+        );
       }
       return 0;
     }
-    throw new Error("用法: dshpkg repo add <url> [名称] | repo remove <名称> | repo list");
+    throw new Error(
+      "用法: dshpkg repo init [--no-default] | repo add <url> [名称] [--format git|index] | repo remove <名称> | repo list",
+    );
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
     return 1;
@@ -1066,6 +1393,9 @@ export const COMMANDS = new Map([
   ["log", cmdLog],
   ["run", cmdRun],
   ["repo", cmdRepo],
+  ["key", cmdKey],
+  ["self-upgrade", cmdSelfUpgrade],
+  ["daemon", cmdDaemon],
   ["help", async (ctx) => { ctx.log(helpText()); return 0; }],
 ]);
 
@@ -1096,9 +1426,17 @@ export function helpText() {
     "  fix-broken                交互式修复 circuit-open 的插件",
     "  log                       输出崩溃事件流（incidents.jsonl）",
     "  run                       启动看门狗守护 dsh（--port N / --profile 名）",
-    "  repo add <url> [名称]     添加配方仓库",
+    "  repo init [--no-default]   首次使用：一键添加默认社区仓库",
+    "  repo add <url> [名称] [--format git|index]",
+    "                            添加配方仓库（--format index = 发布者静态索引源）",
     "  repo remove <名称>        移除配方仓库",
     "  repo list                 列出配方仓库",
+    "  key add <公钥文件|URL|base64行> [标签]  信任一个 minisign 公钥",
+    "  key list                  列出已信任的公钥",
+    "  key remove <keyId>        移除已信任的公钥",
+    "  self-upgrade [版本]       事务化升级 dshpkg 自身（快照+冒烟，失败自动回退）",
+    "  daemon install|uninstall|status",
+    "                            注册/注销/查询看门狗计划任务（Windows 计划任务）",
     "  help                      显示本帮助",
     "",
     "选项:",
@@ -1124,6 +1462,8 @@ const KNOWN_FLAGS = new Set([
   "--help",
   "-h",
   "--",
+  "--no-default",
+  "--format",
 ]);
 
 /**
@@ -1197,6 +1537,12 @@ export function parseArgs(argv) {
       const value = Number(arg.slice("--port=".length));
       if (!Number.isInteger(value) || value <= 0) throw new Error("--port 必须是正整数");
       opts.port = value;
+      continue;
+    }
+    // repo-only flags pass through to the command as positionals (cmdRepo
+    // scans them itself: --format index / --format=index / --no-default).
+    if (arg.startsWith("--format=")) {
+      opts.positionals.push(arg);
       continue;
     }
     if (arg.startsWith("-") && arg !== "-" && !KNOWN_FLAGS.has(arg)) {

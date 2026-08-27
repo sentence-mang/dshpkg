@@ -126,3 +126,36 @@ test("recordCrash does not leak state across calls (no module-level state)", () 
   assert.equal(s2.packages.a, undefined);
   assert.equal(s1.packages.b, undefined);
 });
+
+test("recordCrash rejects dangerous keys without polluting Object.prototype", () => {
+  for (const key of ["__proto__", "constructor", "prototype", "Constructor", "PROTOtype"]) {
+    const state = freshState();
+    recordCrash(state, key, T0);
+    // The canonical pollution check: the shared prototype stays clean.
+    assert.equal(({}).crashTimes, undefined, key);
+    assert.equal(({}).crashCount, undefined, key);
+    assert.equal(({}).circuitOpenAt, undefined, key);
+    // The state object did not gain an own property for the dangerous key.
+    assert.equal(Object.prototype.hasOwnProperty.call(state.packages, key), false, key);
+    // state.packages is still a plain empty object (prototype not swapped).
+    assert.deepEqual(state.packages, {});
+  }
+});
+
+test("isOpen and closeCircuit never read or write through a dangerous key", () => {
+  const state = freshState();
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    assert.equal(isOpen(state, key, T0), false, key);
+    assert.equal(closeCircuit(state, key), state, key);
+  }
+  // Neither read nor write touched Object.prototype.
+  assert.equal(({}).crashTimes, undefined);
+  assert.equal(({}).crashCount, undefined);
+  assert.equal(({}).circuitOpenAt, undefined);
+  assert.deepEqual(state.packages, {});
+  // Non-dangerous entries still work normally after the guard.
+  recordCrash(state, "a", T0);
+  recordCrash(state, "a", T0 + 1);
+  recordCrash(state, "a", T0 + 2);
+  assert.equal(isOpen(state, "a", T0 + 3), true);
+});

@@ -18,15 +18,30 @@
 //     the test suite stays fully offline.
 
 import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { copyFile, readFile, realpath, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { listSnapshots, resolveProfileDir, statePath, readJson } from "../lib/state.js";
+import {
+  listSnapshots,
+  resolveProfileDir,
+  statePath,
+  readJson,
+  appendIncident,
+  readState,
+  writeState,
+  acquireSupervisorLock,
+  releaseSupervisorLock,
+} from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
 import { resolveDshLauncher } from "../lib/launcher.js";
+import { recordCrash, isDangerousKey } from "../lib/circuit.js";
+import { saveSnapshot } from "../lib/snapshot.js";
+import { autoPoll } from "../lib/repo.js";
 
 // --- tuning constants (exported for tests / documentation) -----------------
 
@@ -604,15 +619,9 @@ function parsePortFromArgs(args) {
   return null;
 }
 
-/**
- * Restore the newest snapshot: copies package.json + cordis.patch.yml +
- * pnpm-lock.yaml back into profileDir, then removes our managed blocks.
- * Returns the snapshot timestamp (null when no snapshot exists).
- */
-async function restoreLatestSnapshot(profileDir) {
-  const snapshots = await listSnapshots(); // newest first (state.js convention)
-  if (snapshots.length === 0) return null;
-  const ts = snapshots[0];
+/** Copy one snapshot's three manifest files into the profile (missing files
+ * inside the snapshot are tolerated) and drop every managed block. */
+async function copySnapshotIntoProfile(profileDir, ts) {
   const dir = statePath("snapshots", ts);
   for (const name of ["package.json", "cordis.patch.yml", "pnpm-lock.yaml"]) {
     try {
@@ -623,6 +632,124 @@ async function restoreLatestSnapshot(profileDir) {
   }
   await removeManagedBlock(profileDir);
   return ts;
+}
+
+// --- P3-4: unattributable-failure fallbacks ---------------------------------
+//
+// When failures cannot be blamed on one entry (or the culprit is protected),
+// the supervisor still has to recover: the snapshot chain walks newest ->
+// previous -> ... -> factory baseline, and a drifted lockfile is rebuilt
+// with `pnpm install --frozen-lockfile` before the next spawn. All of it is
+// best-effort and injectable (tests stay offline).
+
+/** Pick the next snapshot to restore: the newest one not yet attempted in
+ * this failure episode, else null (chain exhausted -> factory baseline).
+ * Pure, exported for tests. */
+export function selectSnapshotToRestore(snapshots, attempted) {
+  const tried = new Set(attempted ?? []);
+  for (const ts of snapshots ?? []) {
+    if (!tried.has(ts)) return ts;
+  }
+  return null;
+}
+
+/** P3-4 factory baseline: no managed blocks, patch restored to the official
+ * `[]` placeholder. User content is left untouched. */
+export async function resetToFactoryBaseline(profileDir) {
+  await removeManagedBlock(profileDir);
+  const patchFile = join(profileDir, "cordis.patch.yml");
+  const text = await readTextOrEmpty(patchFile);
+  const cleaned = restoreEmptyArray(text);
+  if (cleaned !== text) await writeFile(patchFile, cleaned, "utf8");
+}
+
+/** sha256 hex of <profileDir>/pnpm-lock.yaml ("" when the file is missing). */
+export async function lockfileHashOf(profileDir) {
+  const text = await readTextOrEmpty(join(profileDir, "pnpm-lock.yaml"));
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** Persist the profile's current lockfile hash as the known-good baseline. */
+async function recordLockfileHash(profileDir) {
+  try {
+    const state = await readState();
+    state.lockfileHash = await lockfileHashOf(profileDir);
+    await writeState(state);
+  } catch {
+    // best-effort
+  }
+}
+
+/** Default lockfile rebuild: pnpm install --frozen-lockfile, never shell. */
+function defaultPnpmInstall(profileDir) {
+  const result = spawnSync("pnpm", ["install", "--frozen-lockfile"], {
+    cwd: profileDir,
+    encoding: "utf8",
+    shell: false,
+    timeout: 120_000,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(result.stderr || "pnpm install --frozen-lockfile 失败");
+  }
+}
+
+// --- Phase 1 wiring: the self-healing pillars reach production --------------
+//
+// P1-1: every supervise event is persisted to incidents.jsonl (via
+// appendIncident). P1-2: attributed crashes are recorded into state.packages
+// with recordCrash, and the open-circuit marker is persisted when the
+// supervisor trips the circuit. P1-3: known-good snapshots are taken at the
+// healthy point and right before a managed disable write. Every wiring call
+// is best-effort: a broken state/incident store must never stop the watchdog.
+
+/** Flatten a supervise event into the incident record appendIncident writes
+ * (type + scalar detail fields + origin context; `t` is added by the writer).
+ * Flat on purpose: cmdAudit/cmdLog read entryId/detail at the top level. */
+export function eventToIncident(event, ctx = {}) {
+  const { type, detail = {} } = event ?? {};
+  return {
+    type,
+    ...(detail && typeof detail === "object" ? detail : { detail }),
+    profile: ctx.profile ?? null,
+    port: ctx.port ?? null,
+  };
+}
+
+/** P1-2: record one crash for entryId in state.json (best-effort). */
+export async function persistCrash(entryId) {
+  if (typeof entryId !== "string" || entryId.length === 0) return;
+  try {
+    const state = await readState();
+    recordCrash(state, entryId, Date.now());
+    await writeState(state);
+  } catch {
+    // crash bookkeeping must never block the watchdog
+  }
+}
+
+/** P1-2: persist an explicit open-circuit marker for entryId (best-effort).
+ * The record is created when missing so the marker survives a supervisor
+ * restart and fix-broken / the HTTP close route can clear it. */
+export async function persistCircuitOpen(entryId) {
+  if (typeof entryId !== "string" || entryId.length === 0) return;
+  if (isDangerousKey(entryId)) return; // never write through the prototype
+  try {
+    const state = await readState();
+    const pkg = ((state.packages ??= {})[entryId] ??= {});
+    pkg.circuitOpenAt =
+      typeof pkg.circuitOpenAt === "number" ? pkg.circuitOpenAt : Date.now();
+    pkg.crashCount = Math.max(pkg.crashCount ?? 0, 3);
+    await writeState(state);
+  } catch {
+    // best-effort
+  }
+}
+
+/** Fire a best-effort async side effect; failures are swallowed. */
+function fire(promiseFactory) {
+  Promise.resolve()
+    .then(promiseFactory)
+    .catch(() => {});
 }
 
 // --- main watchdog loop -----------------------------------------------------
@@ -651,6 +778,10 @@ export async function supervise(
     spawnImpl,
     probeImpl,
     sleepImpl,
+    incidentImpl = appendIncident,
+    snapshotImpl = saveSnapshot,
+    pollImpl = autoPoll,
+    pnpmInstallImpl = defaultPnpmInstall,
   } = {},
 ) {
   // Signal handling must be armed synchronously at entry: a SIGINT/SIGTERM
@@ -707,11 +838,29 @@ export async function supervise(
       } catch {
         // a broken reporter must never stop the watchdog
       }
+      // P1-1: every event also lands in incidents.jsonl (best-effort).
+      fire(() => incidentImpl(eventToIncident({ type, detail }, { profile, port })));
     };
 
     let consecutiveBootFailures = 0;
+    // P3-4: snapshots already restored in the current failure episode (reset
+    // on healthy) — the restore chain walks newest -> previous -> baseline.
+    let attemptedSnapshots = [];
 
     while (!stopped) {
+      // P3-4: rebuild a drifted lockfile before spawning (best-effort; a
+      // failed rebuild must not stop the watchdog).
+      try {
+        const st = await readState();
+        if (st.lockfileHash && st.lockfileHash !== (await lockfileHashOf(profileDir))) {
+          await pnpmInstallImpl(profileDir);
+          const after = await readState();
+          after.lockfileHash = await lockfileHashOf(profileDir);
+          await writeState(after);
+        }
+      } catch {
+        // a broken rebuild must not stop the watchdog
+      }
       // 1) spawn the dsh child (stdio piped for triage).
       let stdoutText = "";
       let stderrText = "";
@@ -785,9 +934,32 @@ export async function supervise(
       if (healthy) {
         // 4) boot success: reset the failure counter and report.
         consecutiveBootFailures = 0;
+        attemptedSnapshots = [];
         emit("healthy", { port, profile });
-        // Stay quiet until the child exits or the user stops us.
-        await Promise.race([exitedPromise, stopPromise]);
+        // P3-4: remember the known-good lockfile hash for drift detection.
+        fire(() => recordLockfileHash(profileDir));
+        // P1-3 trigger ②: snapshot the known-good profile right away — this
+        // is the restore source the 3-failure circuit path needs. Fire-and-
+        // forget is safe here: a crash right after healthy still finds the
+        // previous known-good snapshot (graceful degradation).
+        fire(() => snapshotImpl(profileDir));
+        // P2-4: the idle window also hosts the automatic poll. Each wake-up
+        // gives pollImpl one chance to run (it resolves "poll-done" only when
+        // a poll actually ran); a non-due poll leaves a never-resolving
+        // promise so the window keeps waiting on child exit / SIGINT. The
+        // poll is best-effort and never disturbs probe/exit handling.
+        const NEVER = new Promise(() => {});
+        while (!stopped) {
+          const winner = await Promise.race([
+            exitedPromise,
+            stopPromise,
+            pollImpl()
+              .then((r) => (r?.ran === true ? "poll-done" : NEVER))
+              .catch(() => NEVER),
+          ]);
+          if (winner === "poll-done") continue; // a poll ran; check again
+          break;
+        }
         if (stopped) break;
         exitResult = await exitedPromise;
       }
@@ -868,12 +1040,24 @@ export async function supervise(
       });
 
       if (culprit) {
+        // P1-2: attribute the crash to the culprit's per-package history;
+        // the third crash inside the window opens and persists the circuit.
+        await persistCrash(culprit.entryId);
         if (isProtected(culprit.entryId)) {
           // Spec section 9: core entries must never be disabled. The failure
           // counter and the restart/circuit loop proceed as usual — only the
           // managed disable block write is skipped for protected entries.
           emit("protected-blocked", { entryId: culprit.entryId });
         } else {
+          // P1-3 trigger ③: snapshot BEFORE the disable write, so the
+          // restore path can roll the managed block back. Awaited on
+          // purpose: the snapshot must be complete before the patch
+          // changes, or a restore could capture the disabled state.
+          try {
+            await snapshotImpl(profileDir);
+          } catch {
+            // a broken snapshot store must not block the disable write
+          }
           try {
             await writeManagedDisable(profileDir, culprit.entryId);
           } catch (err) {
@@ -887,16 +1071,34 @@ export async function supervise(
 
       if (consecutiveBootFailures >= BOOT_FAIL_LIMIT) {
         emit("circuit-open", { failures: consecutiveBootFailures });
+        // P1-2: persist the open marker so the circuit survives a supervisor
+        // restart (fix-broken / the HTTP close route clear it again).
+        await persistCircuitOpen(culprit?.entryId ?? null);
         let restoredTs = null;
+        let baseline = false;
         try {
-          restoredTs = await restoreLatestSnapshot(profileDir);
+          // P3-4: walk the snapshot chain (newest -> previous -> ...); when
+          // every snapshot was already tried in this episode, fall back to
+          // the factory baseline instead of re-restoring the same broken
+          // state.
+          const next = selectSnapshotToRestore(
+            await listSnapshots(),
+            attemptedSnapshots,
+          );
+          if (next) {
+            attemptedSnapshots.push(next);
+            restoredTs = await copySnapshotIntoProfile(profileDir, next);
+          } else {
+            await resetToFactoryBaseline(profileDir);
+            baseline = true;
+          }
         } catch (err) {
           emit("boot-failed", {
             reason: "snapshot-restore",
             message: String(err?.message ?? err),
           });
         }
-        emit("snapshot-restored", { ts: restoredTs });
+        emit("snapshot-restored", { ts: restoredTs, baseline });
         consecutiveBootFailures = 0;
       }
 
@@ -991,6 +1193,8 @@ function consoleReporter(profile, port) {
       case "snapshot-restored":
         if (detail.ts) {
           console.log(`[dshpkg] 已从快照 ${detail.ts} 恢复 profile`);
+        } else if (detail.baseline) {
+          console.log("[dshpkg] 快照链已耗尽，回退到出厂基线（无禁用块状态）");
         } else {
           console.error("[dshpkg] 熔断后未找到可用快照，无法自动恢复");
         }
@@ -1010,13 +1214,26 @@ async function main() {
   const opts = parseCliArgs(process.argv.slice(2));
   const port =
     opts.port ?? parsePortFromArgs(opts.args) ?? 3080;
-  await supervise({
-    profile: opts.profile,
-    port: opts.port ?? undefined,
-    args: opts.args,
-    healthPath: opts.healthPath,
-    onEvent: consoleReporter(opts.profile, port),
-  });
+  // P4-3: single instance per state root — a second watchdog must not
+  // double-spawn the profile. The lock is reclaimed when stale (crashed
+  // holder), so a dead supervisor never blocks recovery.
+  const lock = await acquireSupervisorLock();
+  if (!lock.ok) {
+    console.error("[dshpkg] 另一个 dshpkg 看门狗已在运行（supervisor.lock 被占用）");
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    await supervise({
+      profile: opts.profile,
+      port: opts.port ?? undefined,
+      args: opts.args,
+      healthPath: opts.healthPath,
+      onEvent: consoleReporter(opts.profile, port),
+    });
+  } finally {
+    await releaseSupervisorLock();
+  }
 }
 
 const invokedDirectly =

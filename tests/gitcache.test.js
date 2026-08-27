@@ -155,11 +155,34 @@ test("ensureGitCache clones --depth 1 on first use", async () => {
     "clone",
     "--depth",
     "1",
+    "--",
     "https://github.com/owner/repo.git",
     dir,
   ]);
   // materialized by the fake runner: .git + package.json exist
   assert.ok(join(dir, ".git"));
+});
+
+test("ensureGitCache puts -- before the url so a leading dash is not an option", async () => {
+  const git = fakeGitRunner();
+  const dir = await ensureGitCache("https://github.com/owner/dashed.git", git.run);
+  assert.deepEqual(git.calls[0].args, [
+    "clone",
+    "--depth",
+    "1",
+    "--",
+    "https://github.com/owner/dashed.git",
+    dir,
+  ]);
+});
+
+test("ensureGitCache rejects a repo url that starts with a dash (git option injection)", async () => {
+  const git = fakeGitRunner();
+  await assert.rejects(
+    () => ensureGitCache("-u https://evil.example/repo.git", git.run),
+    /不能以 - 开头/,
+  );
+  assert.equal(git.calls.length, 0); // never reaches the runner
 });
 
 test("ensureGitCache fetches + resets on the fast path", async () => {

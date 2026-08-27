@@ -56,7 +56,11 @@ function bootHost({ loader } = {}) {
   return { handler, api };
 }
 
-/** GET /dshpkg/status through the captured handler with a minimal res. */
+/**
+ * GET /dshpkg/status through the captured handler, as a real browser would:
+ * loopback socket + same-origin Origin header (the read route needs no token,
+ * but a tokenless request must still be loopback AND same-origin).
+ */
 async function getStatus({ loader } = {}) {
   const { handler, api } = bootHost({ loader });
   assert.ok(handler, "webServer.register must capture the /dshpkg handler");
@@ -72,7 +76,16 @@ async function getStatus({ loader } = {}) {
       this.body += text;
     },
   };
-  await handler({ socket: null, method: "GET", url: "/dshpkg/status", headers: {} }, res, api);
+  await handler(
+    {
+      socket: { remoteAddress: "127.0.0.1" },
+      method: "GET",
+      url: "/dshpkg/status",
+      headers: { host: "127.0.0.1:3080", origin: "http://127.0.0.1:3080" },
+    },
+    res,
+    api,
+  );
   return { statusCode: res.statusCode, payload: JSON.parse(res.body) };
 }
 
