@@ -1,5 +1,5 @@
 {
-  "name": "dshpkg",
+  "name": "@sentencemang/dshpkg",
   "version": "0.1.0-rc.1",
   "description": "apt-style plugin manager for DeepSeek Harness: AUR-like recipe repos, transactional install with rollback, crash circuit breaker, watchdog self-healing. Depends only on the official kernel.",
   "private": false,

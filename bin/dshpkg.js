@@ -721,13 +721,17 @@ async function cmdKey(ctx, args) {
   }
 }
 
-/** Current dshpkg version from its own package.json (fallback "0.0.0"). */
-async function currentDshpkgVersion() {
+/** Current dshpkg package identity from its own package.json (self-upgrade
+ * must install the REAL package name — the scoped form after publishing). */
+async function currentDshpkgInfo() {
   const pkg = await readJson(
     join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"),
     null,
   );
-  return typeof pkg?.version === "string" ? pkg.version : "0.0.0";
+  return {
+    name: typeof pkg?.name === "string" ? pkg.name : "dshpkg",
+    version: typeof pkg?.version === "string" ? pkg.version : "0.0.0",
+  };
 }
 
 /**
@@ -743,25 +747,26 @@ async function cmdSelfUpgrade(ctx, args, opts) {
     if (!profileDir) throw new Error(`未找到 profile "${profile}"`);
     const target = String(args[0] ?? "latest").trim() || "latest";
     const runner = ctx.runner ?? defaultRunner;
-    const current = await currentDshpkgVersion();
+    const info = await currentDshpkgInfo();
+    const pkgSpec = (name) => `${name}@${target}`;
 
     const snapshotTs = await saveSnapshot(profileDir);
     ctx.log(`已拍恢复快照 ${snapshotTs}`);
-    ctx.log(`升级 dshpkg ${current} -> ${target}...`);
+    ctx.log(`升级 ${info.name} ${info.version} -> ${target}...`);
 
-    const apply = await runner(["add", "-g", `dshpkg@${target}`]);
+    const apply = await runner(["add", "-g", pkgSpec(info.name)]);
     if (apply.status !== 0) {
       throw new Error(`升级失败: ${apply.stderr ?? apply.stdout ?? "未知错误"}`);
     }
     const smoke = await runner(["help"]);
     if (smoke.status !== 0) {
-      const rollback = await runner(["add", "-g", `dshpkg@${current}`]);
+      const rollback = await runner(["add", "-g", `${info.name}@${info.version}`]);
       if (rollback.status !== 0) {
-        ctx.error(`回退失败: 请手动执行 pnpm add -g dshpkg@${current}`);
+        ctx.error(`回退失败: 请手动执行 pnpm add -g ${info.name}@${info.version}`);
       }
-      throw new Error(`新版本冒烟测试失败，已回退到 ${current}`);
+      throw new Error(`新版本冒烟测试失败，已回退到 ${info.version}`);
     }
-    ctx.log(`dshpkg 已升级到 ${target}（冒烟通过）`);
+    ctx.log(`${info.name} 已升级到 ${target}（冒烟通过）`);
     return 0;
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
