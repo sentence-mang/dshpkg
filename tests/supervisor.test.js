@@ -1368,3 +1368,86 @@ test("supervise: clean exit (code 0) stops the supervisor without triage", async
   assert.equal(types.includes("restarting"), false);
   assert.equal(children.length, 1);
 });
+
+// --- supervise: adoptExisting (single-entry contract) -----------------------
+
+test("supervise: adoptExisting adopts a healthy port, takes over on failure", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  let probes = 0;
+  let spawns = 0;
+  const events = [];
+  const children = [];
+  const run = supervise({
+    profile: "web",
+    adoptExisting: true,
+    onEvent: (event) => events.push(event),
+    probeImpl: async () => {
+      probes += 1;
+      if (spawns === 0) {
+        // Adopt phase: the port is healthy for the first 3 probes, so the
+        // watchdog must NOT spawn a competing child. Then it goes unhealthy,
+        // which ends the adopt-watch and falls through to a real spawn.
+        assert.equal(spawns, 0, "must not spawn while the port is healthy");
+        return probes <= 3;
+      }
+      // After take-over spawn: healthy again.
+      return true;
+    },
+    spawnImpl: async () => {
+      spawns += 1;
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    sleepImpl: async () => {},
+    incidentImpl: async () => {},
+    snapshotImpl: async () => {
+      children[0]?.emit("exit", 0, null); // clean exit after healthy
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  await run;
+
+  assert.equal(spawns, 1); // spawned exactly once, only after the port failed
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("adopted"), "emits adopted when the port is healthy");
+  assert.ok(types.includes("healthy"), "eventually takes over and turns healthy");
+  assert.ok(
+    types.indexOf("adopted") < types.indexOf("healthy"),
+    "adopted precedes healthy (take-over order)",
+  );
+});
+
+test("supervise: adoptExisting false (default) never adopts", async (t) => {
+  const { home } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  const events = [];
+  const children = [];
+  const run = supervise({
+    profile: "web",
+    // adoptExisting left at its default (false): a healthy port must still
+    // produce a normal spawn — adopt is opt-in via the CLI only.
+    onEvent: (event) => events.push(event),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+    snapshotImpl: async () => {
+      children[0]?.emit("exit", 0, null);
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  await run;
+
+  const types = events.map((e) => e.type);
+  assert.equal(types.includes("adopted"), false);
+  assert.equal(children.length, 1);
+});
