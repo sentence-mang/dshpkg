@@ -2,6 +2,12 @@
 
 dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [未发布] - 性能优化（optimize）
+
+- 新增 `dshpkg optimize [--apply]` 性能诊断命令：测量 dsh 组合耗时（`--dump-config`，只组合不启动，安全）、插件稳定性/体积打分（熔断 +60、崩溃次数、体积 ≥20MB 加重）、缓存占用分解（快照/git/managed/index）
+- 标记不稳定插件（circuit-open 或崩溃 ≥3 次）；`--apply` 自动禁用不稳定插件（写 `cordis.patch.yml` 禁用块，可逆，`dshpkg enable <名称>` 恢复，核心保护名单跳过）
+- 新增 `lib/perf.js` 模块（measureCompose / scorePlugins / dirSize / cacheStats / mb，零依赖、纯函数可注入测试）
+
 ## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 
 ### Breaking Changes（升级注意）

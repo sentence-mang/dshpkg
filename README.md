@@ -114,7 +114,7 @@ dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
 
-## CLI 命令（30 个命令入口）
+## CLI 命令（31 个命令入口）
 
 | 命令 | 说明 |
 | --- | --- |
@@ -143,6 +143,7 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 | `repo add <url> [名称] [--format git\|index]` | 添加配方仓库（`--format index` = 发布者静态索引源） |
 | `repo remove/list` | 移除 / 列出配方仓库 |
 | `key add/list/remove` | 信任 / 列出 / 移除 minisign 公钥（配方签名验签） |
+| `optimize [--apply]` | 性能诊断：测量组合耗时、标记高负载/不稳定插件、报告缓存占用；`--apply` 自动禁用不稳定插件 |
 | `help` | 显示帮助 |
 
 常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`、`--yes`（非交互确认）。
@@ -163,6 +164,19 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 3. **核心保护名单**：`loader` / `include` / `cordis-host-runner` 等核心条目**永不熔断**——熔断核心只会让 harness 彻底无法启动，因此 host 服务与看门狗都会拒绝（`protected-blocked` 事件）
 
 自愈的每一步都会写入事件流（`incidents.jsonl`），`dshpkg log` 随时可查。
+
+## 性能优化（optimize）
+
+`dshpkg optimize` 用于诊断 dsh 使用中的卡顿，定位高负载与不稳定的插件，并可选自动禁用它们：
+
+- **用法**：`dshpkg optimize`（只诊断，不改动）；`dshpkg optimize --apply`（诊断 + 自动禁用不稳定插件）
+- **做了什么**：
+  - 测量 dsh 组合耗时（`--dump-config`，只组合不启动，安全）
+  - 按稳定性/体积给插件打分：熔断（circuit-open +60 分）、崩溃次数、体积 ≥20MB 加重
+  - 缓存占用分解：快照 / git / managed / index
+  - 标记不稳定插件（circuit-open 或崩溃 ≥3 次）
+- **安全与可逆**：`--apply` 只写 `cordis.patch.yml` 禁用块，**不做删除/卸载**；核心保护名单条目永不禁用；恢复用 `dshpkg enable <名称>`
+- **与其它命令的分工**：`audit` 看崩溃记录、`optimize` 看性能与负载、`doctor` 校验依赖
 
 ## 模型工具与安装守卫
 
