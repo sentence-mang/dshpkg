@@ -35,6 +35,7 @@ import {
   writeState,
   acquireSupervisorLock,
   releaseSupervisorLock,
+  refreshSupervisorLock,
 } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
@@ -55,6 +56,10 @@ export const PROBE_TIMEOUT_MS = 5_000;
 export const PROBE_FAIL_LIMIT = 3;
 /** Consecutive boot failures that open the circuit and restore a snapshot. */
 export const BOOT_FAIL_LIMIT = 3;
+/** How often the live supervisor refreshes its lock heartbeat. Must be well
+ * under SYNC_LOCK_STALE_MS (10 min) so the 5-minute keep-alive re-launch never
+ * mistakes a live watchdog for a dead one and double-spawns it. */
+export const SUPERVISOR_HEARTBEAT_MS = 60_000;
 
 // --- managed marker block convention ---------------------------------------
 
@@ -766,6 +771,11 @@ function fire(promiseFactory) {
  * @param {()=>Promise<object>} [opts.spawnImpl] child factory (injected in tests)
  * @param {({port:number,healthPath:string})=>Promise<boolean>} [opts.probeImpl]
  * @param {(ms:number)=>Promise<void>} [opts.sleepImpl] clock (injected in tests)
+ * @param {boolean} [opts.adoptExisting=false] before the first spawn, probe the
+ *   port once; if a dsh is already healthy there, adopt it (watch-only, then
+ *   take over on failure) instead of spawning a competing child that would
+ *   EADDRINUSE. The CLI enables this so the supervisor becomes the single
+ *   entry even when a manual `dsh web` is already running.
  * @returns {Promise<void>}
  */
 export async function supervise(
@@ -782,6 +792,7 @@ export async function supervise(
     snapshotImpl = saveSnapshot,
     pollImpl = autoPoll,
     pnpmInstallImpl = defaultPnpmInstall,
+    adoptExisting = false,
   } = {},
 ) {
   // Signal handling must be armed synchronously at entry: a SIGINT/SIGTERM
@@ -847,6 +858,32 @@ export async function supervise(
     // on healthy) — the restore chain walks newest -> previous -> baseline.
     let attemptedSnapshots = [];
 
+    // One health probe, normalised to a boolean (never throws).
+    const probeOnce = async () => {
+      try {
+        const result = await doProbe({ port, healthPath });
+        return result === true || result?.ok === true;
+      } catch {
+        return false;
+      }
+    };
+
+    // Pre-flight adopt (single-entry contract): before ever spawning, probe
+    // the port once. If a dsh is already healthy there (e.g. a manual
+    // `dsh web`), adopt it instead of spawning a competing child that would
+    // EADDRINUSE and, worse, climb the boot-failure counter into a snapshot
+    // restore that clobbers the profile. While adopted we only watch: the
+    // moment the port stops answering we fall through and spawn our own child.
+    let adopted = false;
+    if (adoptExisting && (await probeOnce())) {
+      adopted = true;
+      emit("adopted", { port, profile });
+      while (!stopped && (await probeOnce())) {
+        await doSleep(PROBE_INTERVAL_MS);
+      }
+      if (stopped) return;
+    }
+
     while (!stopped) {
       // P3-4: rebuild a drifted lockfile before spawning (best-effort; a
       // failed rebuild must not stop the watchdog).
@@ -889,15 +926,6 @@ export async function supervise(
       // 2) grace period, then periodic health probes.
       await doSleep(GRACE_MS);
       if (stopped) break;
-
-      const probeOnce = async () => {
-        try {
-          const result = await doProbe({ port, healthPath });
-          return result === true || result?.ok === true;
-        } catch {
-          return false;
-        }
-      };
 
       let probeFailures = 0;
       let healthy = false;
@@ -1169,6 +1197,11 @@ function consoleReporter(profile, port) {
           `[dshpkg] profile "${profile}" 探活通过（端口 ${port}），看门狗就绪`,
         );
         break;
+      case "adopted":
+        console.log(
+          `[dshpkg] 端口 ${port} 已有健康 dsh，已接管守护（不再重复启动）`,
+        );
+        break;
       case "boot-failed":
         if (detail.entryId) {
           console.error(
@@ -1223,6 +1256,13 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  // Heartbeat: keep the lock fresh so the 5-minute keep-alive re-launch never
+  // mistakes this live watchdog for a dead one (whose lock would be reclaimed
+  // after SYNC_LOCK_STALE_MS) and double-spawns a second supervisor.
+  const heartbeat = setInterval(() => {
+    refreshSupervisorLock().catch(() => {});
+  }, SUPERVISOR_HEARTBEAT_MS);
+  heartbeat.unref?.();
   try {
     await supervise({
       profile: opts.profile,
@@ -1230,8 +1270,10 @@ async function main() {
       args: opts.args,
       healthPath: opts.healthPath,
       onEvent: consoleReporter(opts.profile, port),
+      adoptExisting: true,
     });
   } finally {
+    clearInterval(heartbeat);
     await releaseSupervisorLock();
   }
 }

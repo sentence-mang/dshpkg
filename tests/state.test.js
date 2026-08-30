@@ -24,6 +24,9 @@ import {
   readState,
   acquireSupervisorLock,
   releaseSupervisorLock,
+  refreshSupervisorLock,
+  recordManagedInstall,
+  removeManagedEntry,
 } from "../lib/state.js";
 import { generateKeyPairSync } from "node:crypto";
 import { readdir } from "node:fs/promises";
@@ -214,4 +217,70 @@ test("supervisor lock is exclusive per state root (P4-3)", async (t) => {
   await releaseSupervisorLock();
   assert.deepEqual(await acquireSupervisorLock(), { ok: true });
   await releaseSupervisorLock();
+});
+
+test("supervisor lock heartbeat keeps a live watchdog from being reclaimed (P4-3)", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "dshpkg-state-sup-heartbeat-"));
+  const prev = process.env.DSH_PKG_HOME;
+  process.env.DSH_PKG_HOME = root;
+  t.after(() => {
+    if (prev === undefined) delete process.env.DSH_PKG_HOME;
+    else process.env.DSH_PKG_HOME = prev;
+  });
+
+  // A watchdog acquires the lock at t0 and runs far longer than staleMs
+  // (10 min); the keep-alive re-launches every 5 min and must NOT reclaim it.
+  const t0 = Date.now();
+  assert.deepEqual(await acquireSupervisorLock({ now: t0 }), { ok: true });
+
+  // Heartbeat bumps the timestamp well past staleMs.
+  const t1 = t0 + 60 * 60 * 1000; // +1 hour
+  await refreshSupervisorLock({ now: t1 });
+
+  // A keep-alive re-launch at t1 sees a fresh lock: still locked, no reclaim.
+  assert.deepEqual(
+    await acquireSupervisorLock({ now: t1, staleMs: 10 * 60 * 1000 }),
+    { ok: false, reason: "locked" },
+  );
+
+  await releaseSupervisorLock();
+});
+
+// ------------------------------------------------- managed ledger (pure)
+
+test("recordManagedInstall writes a managed entry and removeManagedEntry deletes it", () => {
+  const state = { packages: {}, managed: {} };
+  recordManagedInstall(state, "dsh-plugin-x", { version: "1.2.3" });
+  assert.deepEqual(state.managed["dsh-plugin-x"], {
+    installedAt: state.managed["dsh-plugin-x"].installedAt,
+    via: "dshpkg",
+    version: "1.2.3",
+  });
+  assert.ok(typeof state.managed["dsh-plugin-x"].installedAt === "string");
+
+  removeManagedEntry(state, "dsh-plugin-x");
+  assert.equal(state.managed["dsh-plugin-x"], undefined);
+});
+
+test("recordManagedInstall defaults version to null and via to dshpkg", () => {
+  const state = { packages: {}, managed: {} };
+  recordManagedInstall(state, "dsh-plugin-y");
+  assert.equal(state.managed["dsh-plugin-y"].via, "dshpkg");
+  assert.equal(state.managed["dsh-plugin-y"].version, null);
+});
+
+test("recordManagedInstall refuses dangerous keys (no prototype pollution)", () => {
+  const state = { packages: {}, managed: {} };
+  for (const bad of ["__proto__", "constructor", "prototype"]) {
+    recordManagedInstall(state, bad, { version: "1.0.0" });
+    assert.equal(Object.prototype.hasOwnProperty.call(state.managed, bad), false, bad);
+  }
+  removeManagedEntry(state, "__proto__"); // must not throw / reach prototype
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "x"), false);
+});
+
+test("recordManagedInstall re-initializes a missing managed map", () => {
+  const state = { packages: {} };
+  recordManagedInstall(state, "dsh-plugin-z", { version: "2.0.0" });
+  assert.deepEqual(state.managed["dsh-plugin-z"].version, "2.0.0");
 });

@@ -319,6 +319,39 @@ test("install a bare spec installs it and records bookkeeping", async (t) => {
   assert.ok(logs.join("\n").includes("已安装 dsh-plugin-x"));
 });
 
+test("install writes the managed ledger (state.managed)", async (t) => {
+  await makeEnv(t);
+  const { runner } = fakeRunner();
+  const { io } = captureIo({ runner });
+  const code = await runCli(["install", "dsh-plugin-x@2.0.0"], io);
+  assert.equal(code, 0);
+  const state = await readState();
+  assert.ok(state.managed["dsh-plugin-x"], "managed entry expected");
+  assert.equal(state.managed["dsh-plugin-x"].via, "dshpkg");
+  assert.equal(state.managed["dsh-plugin-x"].version, "2.0.0");
+  assert.ok(typeof state.managed["dsh-plugin-x"].installedAt === "string");
+});
+
+test("install with a dep closure records managed entries for every package", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { deps: ["libdep"] }),
+    libdep: recipeOf("libdep", "libdep@0.5.0"),
+  });
+  const { runner } = fakeRunner();
+  const { io } = captureIo({ runner });
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 0);
+  const state = await readState();
+  assert.ok(state.managed["app"]);
+  assert.ok(state.managed["libdep"]);
+  // self package gets its recipe version; dep entries record version null
+  // (mirrors state.packages, where only the self name extracts @version).
+  assert.equal(state.managed["app"].version, "1.0.0");
+  assert.equal(state.managed["libdep"].version, null);
+  assert.equal(state.managed["libdep"].via, "dshpkg");
+});
+
 test("install success snapshots the profile (P1-3 trigger ①)", async (t) => {
   await makeEnv(t);
   const { runner } = fakeRunner();
@@ -500,7 +533,7 @@ test("self-upgrade reports a failed apply without rolling back (P4-2)", async (t
 
 // ------------------------------------------------------ daemon (P4-1)
 
-test("daemon install registers the scheduled task via schtasks (P4-1)", async (t) => {
+test("daemon install registers logon + keep-alive tasks via schtasks (P4-1)", async (t) => {
   await makeEnv(t);
   const calls = [];
   const runner = (args) => {
@@ -510,19 +543,83 @@ test("daemon install registers the scheduled task via schtasks (P4-1)", async (t
   const { io, logs } = captureIo({ runner });
   const code = await runCli(["daemon", "install"], io);
   assert.equal(code, 0);
-  assert.equal(calls[0][0], "schtasks");
-  assert.ok(calls[0].includes("/Create"), calls[0].join(" "));
-  assert.ok(calls[0].includes("dshpkg-supervisor"));
-  assert.ok(calls[0].includes("/SC") && calls[0].includes("MINUTE"));
+  // Two /Create calls: logon task first, keep-alive second.
+  const creates = calls.filter((c) => c.includes("/Create"));
+  assert.equal(creates.length, 2, JSON.stringify(calls));
+  // Logon task: /SC ONLOGON, no repetition flags.
+  assert.ok(creates[0].includes("dshpkg-supervisor"), creates[0].join(" "));
+  assert.ok(creates[0].includes("/SC") && creates[0].includes("ONLOGON"), creates[0].join(" "));
+  assert.ok(creates[0].includes("/RL") && creates[0].includes("LIMITED"), creates[0].join(" "));
+  // Keep-alive task: /SC MINUTE /MO 5.
+  assert.ok(creates[1].includes("dshpkg-supervisor-keepalive"), creates[1].join(" "));
+  assert.ok(creates[1].includes("/SC") && creates[1].includes("MINUTE"), creates[1].join(" "));
+  assert.ok(creates[1].includes("/MO") && creates[1].includes("5"), creates[1].join(" "));
+  // The /TR command quotes the supervisor.ps1 path and passes -Profile.
+  const tr = creates[0][creates[0].indexOf("/TR") + 1];
+  assert.ok(tr.includes("supervisor.ps1"), tr);
+  assert.ok(tr.includes("-Profile web"), tr);
   assert.ok(logs.join("\n").includes("已注册计划任务"));
 });
 
-test("daemon status reflects the task registration (P4-1)", async (t) => {
+test("daemon install --now starts the watchdog immediately (P4-1)", async (t) => {
   await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 0 };
+  };
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["daemon", "install", "--now"], io);
+  assert.equal(code, 0);
+  const run = calls.find((c) => c.includes("/Run"));
+  assert.ok(run, "expected a schtasks /Run call");
+  assert.ok(run.includes("dshpkg-supervisor"), run.join(" "));
+  assert.ok(logs.join("\n").includes("已立即启动看门狗"));
+});
+
+test("daemon install reports failure when keep-alive registration fails (P4-1)", async (t) => {
+  await makeEnv(t);
+  let n = 0;
+  const runner = (args) => {
+    n += 1;
+    return n === 1 ? { status: 0 } : { status: 1, stderr: "boom" };
+  };
+  const { io, errors } = captureIo({ runner });
+  const code = await runCli(["daemon", "install"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("自愈任务失败"), errors.join("\n"));
+});
+
+test("daemon uninstall deletes both tasks (P4-1)", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 0 };
+  };
+  const { io } = captureIo({ runner });
+  const code = await runCli(["daemon", "uninstall"], io);
+  assert.equal(code, 0);
+  const deletes = calls.filter((c) => c.includes("/Delete"));
+  assert.equal(deletes.length, 2, JSON.stringify(calls));
+  const names = deletes.map((c) => c[c.indexOf("/TN") + 1]).sort();
+  assert.deepEqual(names, ["dshpkg-supervisor", "dshpkg-supervisor-keepalive"]);
+});
+
+test("daemon status reflects both tasks' registration (P4-1)", async (t) => {
+  await makeEnv(t);
+  // Both registered -> 0.
   const { io } = captureIo({ runner: () => ({ status: 0 }) });
   assert.equal(await runCli(["daemon", "status"], io), 0);
+  // Neither registered -> 1.
   const { io: io2 } = captureIo({ runner: () => ({ status: 1 }) });
   assert.equal(await runCli(["daemon", "status"], io2), 1);
+  // Only the logon task registered -> 1 (incomplete).
+  let n = 0;
+  const runner = () => (++n === 1 ? { status: 0 } : { status: 1 });
+  const { io: io3, logs } = captureIo({ runner });
+  assert.equal(await runCli(["daemon", "status"], io3), 1);
+  assert.ok(logs.join("\n").includes("不完整"), logs.join("\n"));
 });
 
 test("install a local path probes package.json and adds link: prefixed", async (t) => {
@@ -947,6 +1044,26 @@ test("remove uninstalls and deletes bookkeeping", async (t) => {
   const state = await readState();
   assert.ok(!state.packages["dsh-plugin-x"]);
   assert.ok(logs.join("\n").includes("已移除 dsh-plugin-x"));
+});
+
+test("remove also deletes the managed ledger entry", async (t) => {
+  await makeEnv(t);
+  // seed both packages and managed entries, then remove one
+  await writeState({
+    ...(await readState()),
+    packages: { "dsh-plugin-x": { version: "1.0.0" } },
+    managed: {
+      "dsh-plugin-x": { installedAt: new Date().toISOString(), via: "dshpkg", version: "1.0.0" },
+      "dsh-plugin-y": { installedAt: new Date().toISOString(), via: "dshpkg", version: "2.0.0" },
+    },
+  });
+  const { runner } = fakeRunner();
+  const { io } = captureIo({ runner });
+  const code = await runCli(["remove", "dsh-plugin-x"], io);
+  assert.equal(code, 0);
+  const state = await readState();
+  assert.ok(!state.managed["dsh-plugin-x"]);
+  assert.ok(state.managed["dsh-plugin-y"], "unrelated managed entry must survive");
 });
 
 // ------------------------------------------------------------- hold / unhold

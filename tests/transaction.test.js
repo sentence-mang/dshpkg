@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   resolveDeps,
   expandDeps,
+  findMissingDeps,
   install,
   remove,
   autoremove,
@@ -165,6 +166,58 @@ test("expandDeps stays finite on cyclic recipes (resolveEntries reports later)",
 
 test("resolveDeps throws on a recipe without a name", () => {
   assert.throws(() => resolveDeps({ deps: ["a"] }, {}), /缺少 name/);
+});
+
+// ------------------------------------------------------------- findMissingDeps
+
+test("findMissingDeps flags missing object deps and unresolved string deps", () => {
+  const app = {
+    name: "app",
+    deps: ["known-dep", "unknown-string-dep", { name: "missing-object-dep" }],
+  };
+  const known = { name: "known-dep", deps: [] };
+  const table = new Map([["known-dep", known]]);
+  const { missing, unresolved } = findMissingDeps(app, table);
+  assert.deepEqual(missing, ["missing-object-dep"]);
+  assert.deepEqual(unresolved, ["unknown-string-dep"]);
+});
+
+test("findMissingDeps recurses through resolved deps", () => {
+  const leaf = { name: "leaf", deps: ["ghost"] };
+  const mid = { name: "mid", deps: [leaf] };
+  const app = { name: "app", deps: ["mid"] };
+  const table = new Map([
+    ["mid", mid],
+    ["leaf", leaf],
+  ]);
+  const { missing, unresolved } = findMissingDeps(app, table);
+  assert.deepEqual(missing, []);
+  assert.deepEqual(unresolved, ["ghost"]);
+});
+
+test("findMissingDeps stays finite on cyclic recipe graphs", () => {
+  const a = { name: "a", deps: ["b"] };
+  const b = { name: "b", deps: ["a"] };
+  const table = new Map([
+    ["a", a],
+    ["b", b],
+  ]);
+  const { missing, unresolved } = findMissingDeps(a, table);
+  assert.deepEqual(missing, []);
+  assert.deepEqual(unresolved, []);
+});
+
+test("findMissingDeps dedupes repeated references", () => {
+  const app = { name: "app", deps: ["ghost", "ghost", { name: "gone" }, { name: "gone" }] };
+  const { missing, unresolved } = findMissingDeps(app, new Map());
+  assert.deepEqual(missing, ["gone"]);
+  assert.deepEqual(unresolved, ["ghost"]);
+});
+
+test("findMissingDeps tolerates a recipe without deps", () => {
+  const { missing, unresolved } = findMissingDeps({ name: "solo" }, new Map());
+  assert.deepEqual(missing, []);
+  assert.deepEqual(unresolved, []);
 });
 
 // -------------------------------------------------------------------- install

@@ -30,6 +30,8 @@ import {
   addTrustedKey,
   removeTrustedKey,
   resolvePublicKey,
+  recordManagedInstall,
+  removeManagedEntry,
 } from "../lib/state.js";
 import { search } from "../lib/search.js";
 import {
@@ -41,7 +43,9 @@ import {
   loadAllRecipes,
 } from "../lib/repo.js";
 import { refreshIndex, readIndex } from "../lib/indexer.js";
-import { install, remove, defaultRunner, defaultInstallRunner, autoremove, expandDeps } from "../lib/transaction.js";
+import { install, remove, defaultRunner, defaultInstallRunner, autoremove, expandDeps, findMissingDeps } from "../lib/transaction.js";
+import { checkUpdates, mergeInstalledFromDeps } from "../lib/update.js";
+import { readProfileBundles } from "../lib/bundle.js";
 import { isOpen, closeCircuit, isDangerousKey } from "../lib/circuit.js";
 import { isProtected } from "../lib/protect.js";
 import { runDshSync } from "../lib/launcher.js";
@@ -509,6 +513,27 @@ async function cmdInstall(ctx, args, opts) {
       recordSpec = resolved.recordSpec;
     }
 
+    // Dependency-missing validation (P4-5): after the closure is expanded,
+    // surface deps that resolve to nothing. An OBJECT dep whose name has no
+    // recipe is a hard error (it asks to install a specific recipe's closure,
+    // so a missing recipe cannot fall back to a bare spec); a STRING dep with
+    // no recipe is only a warning (CONTRACTS.md R9 — legal as a bare npm
+    // spec). Both were previously silent.
+    if (recipe) {
+      const recipeByName = new Map(
+        (await loadAllRecipes()).map(({ recipe: r }) => [r.name, r]),
+      );
+      const { missing, unresolved } = findMissingDeps(recipe, recipeByName);
+      if (missing.length > 0) {
+        throw new Error(
+          `依赖缺失: ${missing.join("、")}（配方依赖了不存在的 recipe，无法安装）`,
+        );
+      }
+      for (const dep of unresolved) {
+        ctx.log(`提示: 依赖 "${dep}" 在配方库中无对应 recipe，将按裸 npm 包名安装`);
+      }
+    }
+
     // P3-2: recipe-based installs pass the trust gate (signature check +
     // confirmation card, signing.md §4-5). Direct specs (npm/git) and local
     // paths are explicit user intent and stay ungated; --dry-run never
@@ -541,13 +566,14 @@ async function cmdInstall(ctx, args, opts) {
         throw new Error(`非法的插件名: ${installedName}`);
       }
       const existing = state.packages?.[installedName] ?? {};
+      const version =
+        installedName === name
+          ? versionOf(recordSpec) ?? recipe?.source?.spec?.match(/@([^@/]+)$/)?.[1] ?? null
+          : existing.version ?? null;
       state.packages[installedName] = {
         ...existing,
         source: existing.source ?? (installedName === name ? recordSpec : installedName),
-        version:
-          installedName === name
-            ? versionOf(recordSpec) ?? recipe?.source?.spec?.match(/@([^@/]+)$/)?.[1] ?? null
-            : existing.version ?? null,
+        version,
         kind: installedName === name ? recipe?.kind ?? "unknown" : existing.kind ?? "unknown",
         installedAt: new Date().toISOString(),
         held: existing.held ?? false,
@@ -555,6 +581,8 @@ async function cmdInstall(ctx, args, opts) {
         crashTimes: [],
         circuitOpenAt: null,
       };
+      // Managed ledger: dshpkg itself installed this package (state.managed).
+      recordManagedInstall(state, installedName, { version });
     }
     await writeState(state);
     // P1-3 trigger ①: snapshot the known-good profile right after a
@@ -590,8 +618,9 @@ async function cmdRemove(ctx, args, opts) {
       ctx.log("[dry-run] 移除计划已输出，未做任何修改");
       return 0;
     }
-    if (state.packages?.[name]) {
+    if (state.packages?.[name] || state.managed?.[name]) {
       delete state.packages[name];
+      removeManagedEntry(state, name);
       await writeState(state);
     }
     ctx.log(`已移除 ${name}`);
@@ -792,70 +821,183 @@ function schtasksRunner(args) {
   };
 }
 
+/** The two task names the daemon registers (logon-start + keep-alive). */
+export const DAEMON_TASKS = {
+  logon: "dshpkg-supervisor",
+  keepalive: "dshpkg-supervisor-keepalive",
+};
+
 /**
- * P4-1: Windows Task Scheduler integration — register a task that re-launches
- * supervisor.ps1 every 5 minutes (the supervisor's own single-instance lock
- * makes the schedule idempotent; a crashed watchdog is back within 5 min).
- * schtasks runs as a plain arg array, never a shell.
+ * Build the /TR command string that launches supervisor.ps1 (which resolves
+ * node and DSH_LAUNCHER itself, so no PATH assumptions leak into the task).
+ * Returned as ONE string — schtasks /TR takes a single command line and
+ * re-runs it through cmd.exe, so the script path must be double-quoted.
+ */
+function daemonCommand(profile) {
+  const script = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "supervisor.ps1",
+  );
+  return `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" -Profile ${profile}`;
+}
+
+/**
+ * P4-1: Windows Task Scheduler integration. Registers TWO tasks because
+ * schtasks /RI (repetition) is only valid with time-based schedules
+ * (MINUTE/HOURLY/...), never with /SC ONLOGON:
+ *   1. "dshpkg-supervisor"           /SC ONLOGON  — starts the watchdog at
+ *      logon (the primary requirement).
+ *   2. "dshpkg-supervisor-keepalive" /SC MINUTE /MO 5 — re-launches every 5
+ *      minutes so a crashed watchdog is back within 5 min (the supervisor's
+ *      own single-instance lock makes the re-launch idempotent).
+ * /RL LIMITED keeps both user-scoped (no elevation). schtasks runs as a
+ * plain arg array, never a shell.
  */
 async function cmdDaemon(ctx, args, opts) {
   try {
     const sub = String(args[0] ?? "").trim();
     const runner = ctx.runner ?? schtasksRunner;
-    const task = "dshpkg-supervisor";
+    const profile = opts.profile ?? (await readState()).profile ?? "web";
+    const cmd = daemonCommand(profile);
+    const all = [DAEMON_TASKS.logon, DAEMON_TASKS.keepalive];
     if (sub === "install") {
-      const profile = opts.profile ?? (await readState()).profile ?? "web";
-      const script = join(
-        dirname(fileURLToPath(import.meta.url)),
-        "..",
-        "supervisor.ps1",
-      );
-      const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" -Profile ${profile}`;
-      const result = await runner([
-        "schtasks",
-        "/Create",
-        "/TN",
-        task,
-        "/TR",
-        cmd,
-        "/SC",
-        "MINUTE",
-        "/MO",
-        "5",
-        "/F",
+      const logon = await runner([
+        "schtasks", "/Create", "/TN", DAEMON_TASKS.logon, "/TR", cmd,
+        "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
       ]);
-      if (result.status !== 0) {
-        throw new Error(`注册失败: ${result.stderr ?? result.stdout ?? "未知错误"}`);
+      if (logon.status !== 0) {
+        throw new Error(
+          `注册登录任务失败: ${logon.stderr ?? logon.stdout ?? "未知错误"}`,
+        );
       }
-      ctx.log(`已注册计划任务 ${task}（每 5 分钟拉起看门狗）`);
+      const keepalive = await runner([
+        "schtasks", "/Create", "/TN", DAEMON_TASKS.keepalive, "/TR", cmd,
+        "/SC", "MINUTE", "/MO", "5", "/RL", "LIMITED", "/F",
+      ]);
+      if (keepalive.status !== 0) {
+        throw new Error(
+          `注册自愈任务失败: ${keepalive.stderr ?? keepalive.stdout ?? "未知错误"}`,
+        );
+      }
+      ctx.log(
+        `已注册计划任务 ${DAEMON_TASKS.logon}（登录时启动）与 ${DAEMON_TASKS.keepalive}（每 5 分钟自愈拉起）`,
+      );
+      // --now: start the watchdog immediately instead of waiting for the next
+      // logon / keep-alive tick, so a fresh install guards dsh right away.
+      if (opts.now) {
+        const run = await runner(["schtasks", "/Run", "/TN", DAEMON_TASKS.logon]);
+        if (run.status !== 0) {
+          ctx.error(`立即启动失败: ${run.stderr ?? run.stdout ?? "未知错误"}`);
+        } else {
+          ctx.log("已立即启动看门狗");
+        }
+      }
       return 0;
     }
     if (sub === "uninstall") {
-      const result = await runner(["schtasks", "/Delete", "/TN", task, "/F"]);
-      if (result.status !== 0) {
-        throw new Error(`注销失败: ${result.stderr ?? result.stdout ?? "未知错误"}`);
+      let failed = false;
+      for (const tn of all) {
+        const result = await runner(["schtasks", "/Delete", "/TN", tn, "/F"]);
+        if (result.status !== 0) failed = true;
       }
-      ctx.log(`已注销计划任务 ${task}`);
+      if (failed) ctx.error("注销时部分任务删除失败（可能本就不存在）");
+      else ctx.log(`已注销计划任务 ${all.join(" / ")}`);
       return 0;
     }
     if (sub === "status") {
-      const result = await runner(["schtasks", "/Query", "/TN", task]);
-      if (result.status === 0) {
-        ctx.log("看门狗计划任务已注册");
+      const registered = [];
+      for (const tn of all) {
+        const result = await runner(["schtasks", "/Query", "/TN", tn]);
+        if (result.status === 0) registered.push(tn);
+      }
+      if (registered.length === all.length) {
+        ctx.log("看门狗计划任务已注册（登录启动 + 5 分钟自愈）");
         return 0;
       }
-      ctx.log("看门狗计划任务未注册（运行 dshpkg daemon install 注册）");
+      if (registered.length === 0) {
+        ctx.log("看门狗计划任务未注册（运行 dshpkg daemon install 注册）");
+      } else {
+        ctx.log(
+          `看门狗计划任务不完整：已注册 ${registered.join("、")}，缺失 ${
+            all.filter((tn) => !registered.includes(tn)).join("、")
+          }（运行 dshpkg daemon install 补齐）`,
+        );
+      }
       return 1;
     }
-    throw new Error("用法: dshpkg daemon install|uninstall|status");
+    throw new Error("用法: dshpkg daemon install [--now]|uninstall|status");
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
     return 1;
   }
 }
 
-async function cmdUpdate(ctx, _args, _opts) {
+/**
+ * `dshpkg update --check` — read-only update detection. Builds the installed
+ * set from state.packages (dshpkg's bookkeeping) merged with the profile's
+ * real npm dependencies (via lib/bundle.js), then compares each against the
+ * latest version declared by the recipe repos. Prints a Chinese table of
+ * updateable plugins. Writes nothing; a missing profile degrades to the
+ * state-only view.
+ */
+async function cmdUpdateCheck(ctx, opts) {
+  const state = await readState();
+  const profile = opts.profile ?? state.profile ?? "web";
+
+  // Installed versions: state bookkeeping first, supplemented by the real
+  // profile package.json dependencies (a plugin installed outside dshpkg
+  // still shows up here). The profile dir is resolved through the standard
+  // guard (never a guessed path); a missing profile just yields no extras.
+  const profileDir = await resolveProfileDir(profile);
+  let installed = { ...(state.packages ?? {}) };
+  if (profileDir) {
+    const { deps } = await readProfileBundles(profileDir);
+    installed = mergeInstalledFromDeps(installed, deps);
+  }
+
+  // Latest versions: the recipe repos' source.spec (npm versions). A recipe
+  // whose source.spec is a bare npm name (no @version) carries no concrete
+  // version and is skipped (we cannot compare against "latest").
+  const recipes = await loadAllRecipes();
+  const latestByName = new Map();
+  for (const { recipe } of recipes) {
+    const spec = typeof recipe?.source?.spec === "string" ? recipe.source.spec : "";
+    const m = spec.match(/@(\d[^/@]*)$/);
+    if (m) latestByName.set(recipe.name, m[1]);
+  }
+
+  const rows = checkUpdates(installed, latestByName);
+  const updateable = rows.filter((r) => r.updateable);
+
+  if (updateable.length === 0) {
+    ctx.log("所有已装插件均为最新（或配方库未提供可比较的版本）");
+    return 0;
+  }
+  ctx.log(`发现 ${updateable.length} 个可更新插件:`);
+  printTable(
+    ctx,
+    ["名称", "当前版本", "最新版本", "状态"],
+    updateable.map((r) => [
+      r.name,
+      r.current ?? "未知",
+      r.latest,
+      r.held ? "held（upgrade 将跳过）" : "可更新",
+    ]),
+  );
+  ctx.log("（运行 dshpkg upgrade [名称] 升级，本命令未做任何修改）");
+  return 0;
+}
+
+async function cmdUpdate(ctx, _args, opts) {
   try {
+    // `update --check` is strictly read-only: it compares what is installed
+    // against the recipe repos' latest versions and prints which plugins are
+    // out of date — it does NOT sync, does NOT refresh the index, and writes
+    // nothing to disk.
+    if (opts.check) {
+      return await cmdUpdateCheck(ctx, opts);
+    }
     ctx.log("同步配方仓库...");
     const outcomes = await syncRepos(ctx.fetcher ? { fetcher: ctx.fetcher } : {});
     if (outcomes.length === 0) {
@@ -1540,8 +1682,9 @@ export function helpText() {
     "  key list                  列出已信任的公钥",
     "  key remove <keyId>        移除已信任的公钥",
     "  self-upgrade [版本]       事务化升级 dshpkg 自身（快照+冒烟，失败自动回退）",
-    "  daemon install|uninstall|status",
-    "                            注册/注销/查询看门狗计划任务（Windows 计划任务）",
+    "  daemon install [--now]|uninstall|status",
+    "                            注册/注销/查询看门狗计划任务（Windows 计划任务；",
+    "                            install --now 注册后立即启动一次）",
     "  help                      显示本帮助",
     "",
     "选项:",
@@ -1570,6 +1713,8 @@ const KNOWN_FLAGS = new Set([
   "--no-default",
   "--format",
   "--fix",
+  "--now",
+  "--check",
 ]);
 
 /**
@@ -1590,6 +1735,8 @@ export function parseArgs(argv) {
     help: false,
     yes: false,
     fix: false,
+    now: false,
+    check: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -1628,6 +1775,14 @@ export function parseArgs(argv) {
     }
     if (arg === "--fix") {
       opts.fix = true;
+      continue;
+    }
+    if (arg === "--now") {
+      opts.now = true;
+      continue;
+    }
+    if (arg === "--check") {
+      opts.check = true;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {
