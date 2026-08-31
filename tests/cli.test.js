@@ -533,7 +533,7 @@ test("self-upgrade reports a failed apply without rolling back (P4-2)", async (t
 
 // ------------------------------------------------------ daemon (P4-1)
 
-test("daemon install registers logon + keep-alive tasks via schtasks (P4-1)", async (t) => {
+test("daemon install registers the HKCU Run key (no elevation) by default", async (t) => {
   await makeEnv(t);
   const calls = [];
   const runner = (args) => {
@@ -543,54 +543,19 @@ test("daemon install registers logon + keep-alive tasks via schtasks (P4-1)", as
   const { io, logs } = captureIo({ runner });
   const code = await runCli(["daemon", "install"], io);
   assert.equal(code, 0);
-  // Two /Create calls: logon task first, keep-alive second.
-  const creates = calls.filter((c) => c.includes("/Create"));
-  assert.equal(creates.length, 2, JSON.stringify(calls));
-  // Logon task: /SC ONLOGON, no repetition flags.
-  assert.ok(creates[0].includes("dshpkg-supervisor"), creates[0].join(" "));
-  assert.ok(creates[0].includes("/SC") && creates[0].includes("ONLOGON"), creates[0].join(" "));
-  assert.ok(creates[0].includes("/RL") && creates[0].includes("LIMITED"), creates[0].join(" "));
-  // Keep-alive task: /SC MINUTE /MO 5.
-  assert.ok(creates[1].includes("dshpkg-supervisor-keepalive"), creates[1].join(" "));
-  assert.ok(creates[1].includes("/SC") && creates[1].includes("MINUTE"), creates[1].join(" "));
-  assert.ok(creates[1].includes("/MO") && creates[1].includes("5"), creates[1].join(" "));
-  // The /TR command quotes the supervisor.ps1 path and passes -Profile.
-  const tr = creates[0][creates[0].indexOf("/TR") + 1];
-  assert.ok(tr.includes("supervisor.ps1"), tr);
-  assert.ok(tr.includes("-Profile web"), tr);
-  assert.ok(logs.join("\n").includes("已注册计划任务"));
+  // Default path: a single reg add to the HKCU Run key.
+  const adds = calls.filter((c) => c[0] === "add");
+  assert.equal(adds.length, 1, JSON.stringify(calls));
+  assert.ok(adds[0][1].includes("CurrentVersion\\Run"), adds[0].join(" "));
+  const v = adds[0][adds[0].indexOf("/v") + 1];
+  assert.equal(v, "dshpkg-supervisor");
+  const d = adds[0][adds[0].indexOf("/d") + 1];
+  assert.ok(d.includes("supervisor.ps1"), d);
+  assert.ok(d.includes("-Profile web"), d);
+  assert.ok(logs.join("\n").includes("无需管理员"), logs.join("\n"));
 });
 
-test("daemon install --now starts the watchdog immediately (P4-1)", async (t) => {
-  await makeEnv(t);
-  const calls = [];
-  const runner = (args) => {
-    calls.push([...args]);
-    return { status: 0 };
-  };
-  const { io, logs } = captureIo({ runner });
-  const code = await runCli(["daemon", "install", "--now"], io);
-  assert.equal(code, 0);
-  const run = calls.find((c) => c.includes("/Run"));
-  assert.ok(run, "expected a schtasks /Run call");
-  assert.ok(run.includes("dshpkg-supervisor"), run.join(" "));
-  assert.ok(logs.join("\n").includes("已立即启动看门狗"));
-});
-
-test("daemon install reports failure when keep-alive registration fails (P4-1)", async (t) => {
-  await makeEnv(t);
-  let n = 0;
-  const runner = (args) => {
-    n += 1;
-    return n === 1 ? { status: 0 } : { status: 1, stderr: "boom" };
-  };
-  const { io, errors } = captureIo({ runner });
-  const code = await runCli(["daemon", "install"], io);
-  assert.equal(code, 1);
-  assert.ok(errors.join("\n").includes("自愈任务失败"), errors.join("\n"));
-});
-
-test("daemon uninstall deletes both tasks (P4-1)", async (t) => {
+test("daemon install --system uses schtasks (logon + keep-alive)", async (t) => {
   await makeEnv(t);
   const calls = [];
   const runner = (args) => {
@@ -598,28 +563,49 @@ test("daemon uninstall deletes both tasks (P4-1)", async (t) => {
     return { status: 0 };
   };
   const { io } = captureIo({ runner });
-  const code = await runCli(["daemon", "uninstall"], io);
+  const code = await runCli(["daemon", "install", "--system"], io);
   assert.equal(code, 0);
-  const deletes = calls.filter((c) => c.includes("/Delete"));
-  assert.equal(deletes.length, 2, JSON.stringify(calls));
-  const names = deletes.map((c) => c[c.indexOf("/TN") + 1]).sort();
-  assert.deepEqual(names, ["dshpkg-supervisor", "dshpkg-supervisor-keepalive"]);
+  const creates = calls.filter((c) => c.includes("/Create"));
+  assert.equal(creates.length, 2, JSON.stringify(calls));
+  assert.ok(creates[0].includes("dshpkg-supervisor"), creates[0].join(" "));
+  assert.ok(creates[0].includes("/SC") && creates[0].includes("ONLOGON"), creates[0].join(" "));
+  assert.ok(creates[1].includes("dshpkg-supervisor-keepalive"), creates[1].join(" "));
+  assert.ok(creates[1].includes("/MO") && creates[1].includes("5"), creates[1].join(" "));
 });
 
-test("daemon status reflects both tasks' registration (P4-1)", async (t) => {
+test("daemon install reports failure when the Run key registration fails", async (t) => {
   await makeEnv(t);
-  // Both registered -> 0.
+  const runner = () => ({ status: 1, stderr: "boom" });
+  const { io, errors } = captureIo({ runner });
+  const code = await runCli(["daemon", "install"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("开机自启失败"), errors.join("\n"));
+});
+
+test("daemon uninstall deletes the HKCU Run value by default", async (t) => {
+  await makeEnv(t);
+  const calls = [];
+  const runner = (args) => {
+    calls.push([...args]);
+    return { status: 0 };
+  };
+  const { io, logs } = captureIo({ runner });
+  const code = await runCli(["daemon", "uninstall"], io);
+  assert.equal(code, 0);
+  const dels = calls.filter((c) => c[0] === "delete");
+  assert.equal(dels.length, 1, JSON.stringify(calls));
+  assert.equal(dels[0][dels[0].indexOf("/v") + 1], "dshpkg-supervisor");
+  assert.ok(logs.join("\n").includes("已注销开机自启"), logs.join("\n"));
+});
+
+test("daemon status reflects the HKCU Run key registration", async (t) => {
+  await makeEnv(t);
+  // Registered -> 0.
   const { io } = captureIo({ runner: () => ({ status: 0 }) });
   assert.equal(await runCli(["daemon", "status"], io), 0);
-  // Neither registered -> 1.
+  // Not registered -> 1.
   const { io: io2 } = captureIo({ runner: () => ({ status: 1 }) });
   assert.equal(await runCli(["daemon", "status"], io2), 1);
-  // Only the logon task registered -> 1 (incomplete).
-  let n = 0;
-  const runner = () => (++n === 1 ? { status: 0 } : { status: 1 });
-  const { io: io3, logs } = captureIo({ runner });
-  assert.equal(await runCli(["daemon", "status"], io3), 1);
-  assert.ok(logs.join("\n").includes("不完整"), logs.join("\n"));
 });
 
 test("install a local path probes package.json and adds link: prefixed", async (t) => {
