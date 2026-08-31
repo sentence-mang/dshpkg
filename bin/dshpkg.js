@@ -803,187 +803,12 @@ async function cmdSelfUpgrade(ctx, args, opts) {
   }
 }
 
-/** schtasks runner for daemon management: spawnSync, never a shell (and
- * never through the dsh launcher — that is what this dedicated runner is
- * for: the daemon commands talk to the OS task scheduler directly). */
-function schtasksRunner(args) {
-  const result = spawnSync("schtasks", args, {
-    encoding: "utf8",
-    shell: false,
-    windowsHide: true,
-    timeout: 30_000,
-  });
-  return {
-    status: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-    error: result.error,
-  };
-}
-
-/** The two task names the daemon registers (logon-start + keep-alive). */
-export const DAEMON_TASKS = {
-  logon: "dshpkg-supervisor",
-  keepalive: "dshpkg-supervisor-keepalive",
-};
-
 /**
- * Build the /TR command string that launches supervisor.ps1 (which resolves
- * node and DSH_LAUNCHER itself, so no PATH assumptions leak into the task).
- * Returned as ONE string — schtasks /TR takes a single command line and
- * re-runs it through cmd.exe, so the script path must be double-quoted.
+ * NOTE: dshpkg deliberately does NOT register any OS-level auto-start
+ * (no HKCU Run key, no Windows Task Scheduler). dshpkg is a dsh-ecosystem
+ * plugin manager — touching system-global state is out of scope. To guard a
+ * running dsh session, use the on-demand `dshpkg run` watchdog instead.
  */
-function daemonCommand(profile) {
-  const script = join(
-    dirname(fileURLToPath(import.meta.url)),
-    "..",
-    "supervisor.ps1",
-  );
-  return `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" -Profile ${profile}`;
-}
-
-/** HKCU Run key — per-user auto-start, no elevation required. */
-export const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-export const RUN_VALUE = "dshpkg-supervisor";
-
-/** reg.exe runner (spawnSync, never a shell). */
-function regRunner(args) {
-  const result = spawnSync("reg", args, {
-    encoding: "utf8",
-    shell: false,
-    windowsHide: true,
-    timeout: 30_000,
-  });
-  return {
-    status: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-    error: result.error,
-  };
-}
-
-/**
- * P4-1: Windows auto-start watchdog.
- *
- * DEFAULT strategy is the per-user HKCU Run key (`reg add
- * HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v dshpkg-supervisor`),
- * which needs NO admin rights — a normal user registers it themselves, so
- * `dshpkg daemon install` works without elevation or a UAC prompt. At every
- * logon Windows starts supervisor.ps1, which supervises dsh continuously
- * (crash -> triage -> snapshot restore -> restart). The supervisor's own
- * single-instance lock makes duplicate launches idempotent, so no separate
- * keep-alive task is needed.
- *
- * `--system` opts into the Task Scheduler (schtasks) path instead — TWO tasks
- * (ONLOGON + every-5-min keep-alive), which DOES require admin elevation; it
- * is kept for service-like installs where the Run key is unsuitable.
- */
-async function cmdDaemon(ctx, args, opts) {
-  try {
-    const sub = String(args[0] ?? "").trim();
-    const profile = opts.profile ?? (await readState()).profile ?? "web";
-    const cmd = daemonCommand(profile);
-    const runner = ctx.daemonRunner ?? (opts.system ? schtasksRunner : regRunner);
-    if (sub === "install") {
-      if (opts.system) {
-        // schtasks path: two tasks (logon + keep-alive), admin required.
-        const logon = await runner([
-          "schtasks", "/Create", "/TN", DAEMON_TASKS.logon, "/TR", cmd,
-          "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
-        ]);
-        if (logon.status !== 0) {
-          throw new Error(
-            `注册登录任务失败: ${logon.stderr ?? logon.stdout ?? "未知错误"}`,
-          );
-        }
-        const keepalive = await runner([
-          "schtasks", "/Create", "/TN", DAEMON_TASKS.keepalive, "/TR", cmd,
-          "/SC", "MINUTE", "/MO", "5", "/RL", "LIMITED", "/F",
-        ]);
-        if (keepalive.status !== 0) {
-          throw new Error(
-            `注册自愈任务失败: ${keepalive.stderr ?? keepalive.stdout ?? "未知错误"}`,
-          );
-        }
-        ctx.log(
-          `已注册计划任务 ${DAEMON_TASKS.logon}（登录启动）与 ${DAEMON_TASKS.keepalive}（每 5 分钟自愈拉起）`,
-        );
-      } else {
-        // HKCU Run key: no elevation, auto-starts supervisor at logon.
-        const res = await runner([
-          "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", cmd, "/f",
-        ]);
-        if (res.status !== 0) {
-          throw new Error(
-            `注册开机自启失败: ${res.stderr ?? res.stdout ?? "未知错误"}`,
-          );
-        }
-        ctx.log(
-          `已注册开机自启（HKCU Run 键 ${RUN_VALUE}，登录时自动启动看门狗，无需管理员）`,
-        );
-      }
-      if (opts.now) {
-        if (opts.system) {
-          const run = await runner(["schtasks", "/Run", "/TN", DAEMON_TASKS.logon]);
-          if (run.status !== 0) {
-            ctx.error(`立即启动失败: ${run.stderr ?? run.stdout ?? "未知错误"}`);
-          } else {
-            ctx.log("已立即启动看门狗");
-          }
-        } else {
-          ctx.log("立即启动看门狗：运行 dshpkg run 或等待下次登录（注册已生效）");
-        }
-      }
-      return 0;
-    }
-    if (sub === "uninstall") {
-      if (opts.system) {
-        let failed = false;
-        for (const tn of [DAEMON_TASKS.logon, DAEMON_TASKS.keepalive]) {
-          const result = await runner(["schtasks", "/Delete", "/TN", tn, "/F"]);
-          if (result.status !== 0) failed = true;
-        }
-        if (failed) ctx.error("注销时部分任务删除失败（可能本就不存在）");
-        else ctx.log(`已注销计划任务 ${DAEMON_TASKS.logon} / ${DAEMON_TASKS.keepalive}`);
-        return 0;
-      }
-      const res = await runner(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
-      if (res.status !== 0) ctx.error("注销开机自启失败（可能本就不存在）");
-      else ctx.log(`已注销开机自启（${RUN_VALUE}）`);
-      return 0;
-    }
-    if (sub === "status") {
-      if (opts.system) {
-        const registered = [];
-        for (const tn of [DAEMON_TASKS.logon, DAEMON_TASKS.keepalive]) {
-          const result = await runner(["schtasks", "/Query", "/TN", tn]);
-          if (result.status === 0) registered.push(tn);
-        }
-        if (registered.length === 2) {
-          ctx.log("看门狗计划任务已注册（登录启动 + 5 分钟自愈）");
-          return 0;
-        }
-        if (registered.length === 0) {
-          ctx.log("看门狗计划任务未注册（运行 dshpkg daemon install --system 注册，需管理员）");
-        } else {
-          ctx.log(`看门狗计划任务不完整：已注册 ${registered.join("、")}`);
-        }
-        return 1;
-      }
-      const res = await runner(["query", RUN_KEY, "/v", RUN_VALUE]);
-      if (res.status === 0) {
-        ctx.log(`看门狗开机自启已注册（HKCU Run 键 ${RUN_VALUE}，登录时自动守护 dsh）`);
-        return 0;
-      }
-      ctx.log("看门狗开机自启未注册（运行 dshpkg daemon install 注册，无需管理员）");
-      return 1;
-    }
-    throw new Error("用法: dshpkg daemon install [--now]|uninstall|status [--system]");
-  } catch (err) {
-    ctx.error(`错误: ${err?.message ?? err}`);
-    return 1;
-  }
-}
 
 /**
  * `dshpkg update --check` — read-only update detection. Builds the installed
@@ -1693,7 +1518,6 @@ export const COMMANDS = new Map([
   ["repo", cmdRepo],
   ["key", cmdKey],
   ["self-upgrade", cmdSelfUpgrade],
-  ["daemon", cmdDaemon],
   ["help", async (ctx) => { ctx.log(helpText()); return 0; }],
 ]);
 
@@ -1734,9 +1558,6 @@ export function helpText() {
     "  key list                  列出已信任的公钥",
     "  key remove <keyId>        移除已信任的公钥",
     "  self-upgrade [版本]       事务化升级 dshpkg 自身（快照+冒烟，失败自动回退）",
-    "  daemon install [--now]|uninstall|status",
-    "                            注册/注销/查询看门狗计划任务（Windows 计划任务；",
-    "                            install --now 注册后立即启动一次）",
     "  help                      显示本帮助",
     "",
     "选项:",
@@ -1767,7 +1588,6 @@ const KNOWN_FLAGS = new Set([
   "--fix",
   "--now",
   "--check",
-  "--system",
 ]);
 
 /**
@@ -1790,7 +1610,6 @@ export function parseArgs(argv) {
     fix: false,
     now: false,
     check: false,
-    system: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -1837,10 +1656,6 @@ export function parseArgs(argv) {
     }
     if (arg === "--check") {
       opts.check = true;
-      continue;
-    }
-    if (arg === "--system") {
-      opts.system = true;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {
@@ -1908,7 +1723,7 @@ export function defaultDshRun(args, deps = {}) {
  * every call); in production the add steps use the capturing install runner
  * so pnpm output (allowBuilds hints, network errors) can be inspected.
  */
-function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner, daemonRunner } = {}) {
+function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner } = {}) {
   const resolvedRunner = runner ?? defaultRunner;
   const askInjected = typeof ask === "function";
   return {
@@ -1920,7 +1735,6 @@ function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spaw
     canPrompt: askInjected || process.stdin.isTTY === true,
     runner: resolvedRunner,
     installRunner: installRunner ?? (runner ? resolvedRunner : defaultInstallRunner),
-    daemonRunner: daemonRunner ?? null, // injectable daemon OS-call runner (tests)
     dshRun: dshRun ?? defaultDshRun,
     fetcher: fetcher ?? null,
     spawnImpl: spawnImpl ?? null,
