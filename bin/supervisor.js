@@ -36,6 +36,7 @@ import {
   acquireSupervisorLock,
   releaseSupervisorLock,
   refreshSupervisorLock,
+  withSyncLock,
 } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
@@ -43,6 +44,7 @@ import { resolveDshLauncher } from "../lib/launcher.js";
 import { recordCrash, isDangerousKey } from "../lib/circuit.js";
 import { saveSnapshot } from "../lib/snapshot.js";
 import { autoPoll } from "../lib/repo.js";
+import { checkPort, evictPortHolder, PORT_BUSY_BACKOFF_MS } from "../lib/portcheck.js";
 
 // --- tuning constants (exported for tests / documentation) -----------------
 
@@ -478,6 +480,14 @@ function managedBlockContainsId(blockText, entryId) {
  * @returns {Promise<{written:boolean}>}
  */
 export async function writeManagedDisable(profileDir, entryId) {
+  // R19: the patch layer is shared with the CLI and the in-process guardian
+  // — serialize the read-modify-write under the sync lock. Callers that
+  // ALREADY hold the lock (copySnapshotIntoProfile) use the Impl directly:
+  // withSyncLock is not reentrant.
+  return withSyncLock(() => writeManagedDisableImpl(profileDir, entryId));
+}
+
+async function writeManagedDisableImpl(profileDir, entryId) {
   const patchFile = join(profileDir, "cordis.patch.yml");
   let text = "";
   try {
@@ -515,6 +525,11 @@ export async function writeManagedDisable(profileDir, entryId) {
  * @returns {Promise<number>} number of removed blocks
  */
 export async function removeManagedBlock(profileDir) {
+  // R19: same read-modify-write surface as writeManagedDisable.
+  return withSyncLock(() => removeManagedBlockImpl(profileDir));
+}
+
+async function removeManagedBlockImpl(profileDir) {
   const patchFile = join(profileDir, "cordis.patch.yml");
   let text;
   try {
@@ -626,17 +641,25 @@ function parsePortFromArgs(args) {
 
 /** Copy one snapshot's three manifest files into the profile (missing files
  * inside the snapshot are tolerated) and drop every managed block. */
-async function copySnapshotIntoProfile(profileDir, ts) {
-  const dir = statePath("snapshots", ts);
-  for (const name of ["package.json", "cordis.patch.yml", "pnpm-lock.yaml"]) {
-    try {
-      await copyFile(join(dir, name), join(profileDir, name));
-    } catch {
-      // a missing file inside the snapshot is tolerated
+function copySnapshotIntoProfileImpl(profileDir, ts) {
+  return (async () => {
+    const dir = statePath("snapshots", ts);
+    for (const name of ["package.json", "cordis.patch.yml", "pnpm-lock.yaml"]) {
+      try {
+        await copyFile(join(dir, name), join(profileDir, name));
+      } catch {
+        // a missing file inside the snapshot is tolerated
+      }
     }
-  }
-  await removeManagedBlock(profileDir);
-  return ts;
+    // Already under the sync lock: use the impl (no reentrant re-acquire).
+    await removeManagedBlockImpl(profileDir);
+    return ts;
+  })();
+}
+
+/** R19: serialize the whole snapshot-restore write burst under the lock. */
+async function copySnapshotIntoProfile(profileDir, ts) {
+  return withSyncLock(() => copySnapshotIntoProfileImpl(profileDir, ts));
 }
 
 // --- P3-4: unattributable-failure fallbacks ---------------------------------
@@ -661,11 +684,15 @@ export function selectSnapshotToRestore(snapshots, attempted) {
 /** P3-4 factory baseline: no managed blocks, patch restored to the official
  * `[]` placeholder. User content is left untouched. */
 export async function resetToFactoryBaseline(profileDir) {
-  await removeManagedBlock(profileDir);
-  const patchFile = join(profileDir, "cordis.patch.yml");
-  const text = await readTextOrEmpty(patchFile);
-  const cleaned = restoreEmptyArray(text);
-  if (cleaned !== text) await writeFile(patchFile, cleaned, "utf8");
+  // R19: same shared-surface rule; inner impls avoid the non-reentrant
+  // re-acquire.
+  await withSyncLock(async () => {
+    await removeManagedBlockImpl(profileDir);
+    const patchFile = join(profileDir, "cordis.patch.yml");
+    const text = await readTextOrEmpty(patchFile);
+    const cleaned = restoreEmptyArray(text);
+    if (cleaned !== text) await writeFile(patchFile, cleaned, "utf8");
+  });
 }
 
 /** sha256 hex of <profileDir>/pnpm-lock.yaml ("" when the file is missing). */
@@ -793,6 +820,8 @@ export async function supervise(
     pollImpl = autoPoll,
     pnpmInstallImpl = defaultPnpmInstall,
     adoptExisting = false,
+    portCheckImpl = (p) => checkPort(p),
+    evictImpl = (p) => evictPortHolder(p),
   } = {},
 ) {
   // Signal handling must be armed synchronously at entry: a SIGINT/SIGTERM
@@ -885,6 +914,30 @@ export async function supervise(
     }
 
     while (!stopped) {
+      // R18 port arbitration: an EADDRINUSE boot crash happens in the
+      // dsh-web-app layer, BEFORE dshpkg loads, so nothing in-process can
+      // ever see it — the watchdog settles the port BEFORE spawning. A stale
+      // dsh instance holding the port is evicted; a non-dsh holder is never
+      // killed (the event carries a Chinese reason; backoff prevents a
+      // retry flood).
+      try {
+        const portState = await portCheckImpl(port);
+        if (portState && portState.free === false) {
+          const eviction = await evictImpl(port);
+          if (!eviction.ok) {
+            emit("port-busy", {
+              port,
+              pid: portState.pid ?? null,
+              reason: eviction.reason,
+            });
+            await doSleep(PORT_BUSY_BACKOFF_MS);
+            continue;
+          }
+          emit("port-evicted", { port, evicted: eviction.evicted ?? 1 });
+        }
+      } catch {
+        // a broken arbitration must never stop the watchdog
+      }
       // P3-4: rebuild a drifted lockfile before spawning (best-effort; a
       // failed rebuild must not stop the watchdog).
       try {
@@ -1015,6 +1068,21 @@ export async function supervise(
           .split(/\r?\n/)
           .map((line) => line.trim())
           .find((line) => line.length > 0) ?? "";
+      // R18 EADDRINUSE exemption: a port-contention crash is NOT a plugin
+      // bug — NO entry is disabled, the plugin crash counter does not climb,
+      // no snapshot is restored; the loop restarts and the pre-spawn port
+      // arbitration handles the holder.
+      if (/EADDRINUSE|address already in use/i.test(output)) {
+        emit("boot-failed", {
+          code,
+          signal,
+          reason: "port-busy",
+          entryId: null,
+          detail: firstLine,
+        });
+        await doSleep(PROBE_INTERVAL_MS);
+        continue;
+      }
       const triaged = parseLoaderErrors(output);
       let culprit = triaged.length > 0 ? triaged[triaged.length - 1] : null;
       if (!culprit) {

@@ -1,4 +1,7 @@
 # dshpkg — apt-style plugin manager host service (L1 stable layer).
+# `name` MUST be the resolvable package name: the loader imports it from the
+# profile directory (Node resolution), and a bare id here crashed every boot
+# with ERR_MODULE_NOT_FOUND (R16 root cause).
 - insert:
     - id: dshpkg
-      name: dshpkg
+      name: "@sentencemang/dshpkg"

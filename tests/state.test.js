@@ -15,6 +15,7 @@ import {
   INCIDENTS_MAX,
   acquireSyncLock,
   releaseSyncLock,
+  withSyncLock,
   statePath,
   addTrustedKey,
   removeTrustedKey,
@@ -283,4 +284,84 @@ test("recordManagedInstall re-initializes a missing managed map", () => {
   const state = { packages: {} };
   recordManagedInstall(state, "dsh-plugin-z", { version: "2.0.0" });
   assert.deepEqual(state.managed["dsh-plugin-z"].version, "2.0.0");
+});
+
+// --- withSyncLock (R19: shared-surface serialization) -----------------------
+
+/** Fresh isolated DSH_PKG_HOME (the lock lives under the state root). */
+async function withPkgRoot(t) {
+  const root = await mkdtemp(join(tmpdir(), "dshpkg-state-lockwrap-"));
+  const prev = process.env.DSH_PKG_HOME;
+  process.env.DSH_PKG_HOME = root;
+  t.after(() => {
+    if (prev === undefined) delete process.env.DSH_PKG_HOME;
+    else process.env.DSH_PKG_HOME = prev;
+  });
+  return root;
+}
+
+test("withSyncLock runs fn under the lock and releases it afterwards", async (t) => {
+  await withPkgRoot(t);
+  const result = await withSyncLock(async () => 42);
+  assert.equal(result, 42);
+  // the lock is released: a fresh acquire succeeds
+  assert.deepEqual(await acquireSyncLock(), { ok: true });
+  await releaseSyncLock();
+});
+
+test("withSyncLock degrades on contention: fn still runs, lock-busy recorded", async (t) => {
+  await withPkgRoot(t);
+  // an external holder (another process in reality)
+  assert.deepEqual(await acquireSyncLock(), { ok: true });
+  let ran = false;
+  const result = await withSyncLock(
+    async () => {
+      ran = true;
+      return "done";
+    },
+    { sleepImpl: async () => {} },
+  );
+  assert.equal(ran, true, "the guarded operation must still run unlocked");
+  assert.equal(result, "done");
+  const incidents = await readIncidents(10);
+  assert.ok(incidents.some((e) => e.type === "lock-busy"), "lock-busy incident recorded");
+  await releaseSyncLock();
+});
+
+test("withSyncLock honors injected acquire/release/sleep impls", async () => {
+  let acquires = 0;
+  let releases = 0;
+  let slept = 0;
+  await withSyncLock(async () => {}, {
+    acquireImpl: async () => {
+      acquires += 1;
+      return { ok: true };
+    },
+    releaseImpl: async () => {
+      releases += 1;
+    },
+    sleepImpl: async () => {
+      slept += 1;
+    },
+  });
+  assert.equal(acquires, 1);
+  assert.equal(releases, 1);
+  assert.equal(slept, 0, "no retry sleep when the first acquire wins");
+});
+
+test("withSyncLock retries once after a pause before degrading", async () => {
+  let acquires = 0;
+  let slept = 0;
+  await withSyncLock(async () => {}, {
+    acquireImpl: async () => {
+      acquires += 1;
+      return { ok: false, reason: "locked" };
+    },
+    releaseImpl: async () => {},
+    sleepImpl: async () => {
+      slept += 1;
+    },
+  });
+  assert.equal(acquires, 2, "one retry after the first refusal");
+  assert.equal(slept, 1);
 });

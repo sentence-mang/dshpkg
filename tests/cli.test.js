@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1511,6 +1511,458 @@ test("upgrade skips circuit-open packages with a hint", async (t) => {
   assert.ok(errors.join("\n").includes("fix-broken"));
 });
 
+test("upgrade restores the pre-upgrade snapshot when the rollback fails", async (t) => {
+  const { profileDir } = await makeEnv(t, {
+    deps: { "dsh-plugin-a": "^1.0.0" },
+    packages: { "dsh-plugin-a": { version: "1.0.0", held: false } },
+    patch: "[]\n",
+  });
+  // restoreSnapshot is strict: all three manifest files must exist
+  await writeFile(join(profileDir, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+  const beforeManifest = await readFile(join(profileDir, "package.json"), "utf8");
+  // The add succeeds but corrupts the manifest (simulating a broken pnpm
+  // write); the smoke dump-config then fails, so the transaction rolls
+  // back — and the rollback remove fails too (rolledBack: false), which
+  // must trigger the snapshot restore.
+  let dumpCount = 0;
+  const { runner } = fakeRunner((args) => {
+    if (args.includes("--dump-config")) {
+      dumpCount += 1;
+      return dumpCount >= 2 ? 1 : 0; // precheck ok, smoke fails
+    }
+    if (args[0] === "plugin" && args[3] === "add") {
+      writeFileSync(join(profileDir, "package.json"), JSON.stringify({ corrupted: true }));
+      return 0;
+    }
+    if (args[0] === "plugin" && args[3] === "remove") return 1; // rollback fails
+    return 0;
+  });
+  const { io, logs, errors } = captureIo({ runner });
+  const code = await runCli(["upgrade"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("升级失败"));
+  assert.ok(logs.join("\n").includes("已回滚 profile 到升级前快照"), logs.join("\n"));
+  // the corrupted manifest is replaced by the snapshot's known-good copy
+  assert.equal(await readFile(join(profileDir, "package.json"), "utf8"), beforeManifest);
+});
+
+// --------------------------------------------------------------- bootstrap
+
+/** Rewrite the temp profile manifest with an explicit bundles list. */
+async function withBundles(profileDir, bundles) {
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  manifest.dsh = { profile: { bundles } };
+  await writeFile(join(profileDir, "package.json"), JSON.stringify(manifest, null, 2));
+}
+
+test("bootstrap registers dshpkg in bundles and re-layers the profile", async (t) => {
+  const { profileDir } = await makeEnv(t, {
+    deps: {
+      "@sentencemang/dshpkg": "link:.",
+      "dsh-boot-guard": "^1.1.0",
+      "dsh-a": "^1.0.0",
+    },
+  });
+  // dshpkg is installed but NOT declared as a bundle (the reported bug)
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-a",
+    "dsh-boot-guard",
+  ]);
+  const { io, logs } = captureIo();
+  const code = await runCli(["bootstrap"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("已将 dshpkg 注册到"), logs.join("\n"));
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  assert.deepEqual(manifest.dsh.profile.bundles, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "@sentencemang/dshpkg", // first non-kernel bundle (guardian layer)
+    "dsh-boot-guard",
+    "dsh-a",
+  ]);
+});
+
+test("bootstrap is idempotent and reports an existing registration", async (t) => {
+  const { profileDir } = await makeEnv(t, {
+    deps: { "@sentencemang/dshpkg": "link:.", "dsh-a": "^1.0.0" },
+  });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "@sentencemang/dshpkg",
+    "dsh-a",
+  ]);
+  const { io, logs } = captureIo();
+  const code = await runCli(["bootstrap"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("已在 profile"));
+});
+
+test("bootstrap fails on an unknown profile without touching anything", async (t) => {
+  await makeEnv(t);
+  const { io, errors } = captureIo();
+  const code = await runCli(["bootstrap", "--profile", "no-such-profile"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("找不到 profile"));
+});
+
+// ------------------------------------------------- doctor bundle layering
+
+test("doctor flags dshpkg missing from the profile bundles", async (t) => {
+  const { profileDir } = await makeEnv(t, { deps: { "dsh-a": "^1.0.0" } });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-a",
+  ]);
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, errors } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("未注册到 bundles"));
+});
+
+test("doctor flags guardians loading after plain plugins", async (t) => {
+  const { profileDir } = await makeEnv(t, {
+    deps: {
+      "@sentencemang/dshpkg": "link:.",
+      "dsh-boot-guard": "^1.1.0",
+      "dsh-a": "^1.0.0",
+    },
+  });
+  // guardian present but a plain plugin loads first
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-a",
+    "@sentencemang/dshpkg",
+    "dsh-boot-guard",
+  ]);
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, errors } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("守护层未紧跟内核"));
+});
+
+test("doctor passes when the guardian layer sits right after the kernel", async (t) => {
+  const { profileDir } = await makeEnv(t, {
+    deps: {
+      "@sentencemang/dshpkg": "link:.",
+      "dsh-boot-guard": "^1.1.0",
+      "dsh-a": "^1.0.0",
+    },
+  });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "@sentencemang/dshpkg",
+    "dsh-boot-guard",
+    "dsh-a",
+  ]);
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, logs } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("守护层位置正确"));
+});
+
+test("doctor flags a missing installed dependency and hints reconcile", async (t) => {
+  const { profileDir } = await makeEnv(t, { deps: { "dsh-plugin-a": "^1.0.0" } });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-plugin-a",
+  ]);
+  // installed manifest declares dep-x, which is NOT on disk
+  const pkgDir = join(profileDir, "node_modules", "dsh-plugin-a");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "package.json"),
+    JSON.stringify({
+      name: "dsh-plugin-a",
+      dependencies: { "dep-x": "^1.0.0" },
+      dsh: { bundle: { patch: "./cordis.patch.yml" } },
+    }),
+  );
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, errors } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("dsh-plugin-a 缺少依赖 dep-x"), errors.join("\n"));
+  assert.ok(errors.join("\n").includes("dshpkg reconcile --fix"));
+});
+
+test("doctor --fix fills a missing installed dependency", async (t) => {
+  const { profileDir } = await makeEnv(t, { deps: { "dsh-plugin-a": "^1.0.0" } });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-plugin-a",
+  ]);
+  const pkgDir = join(profileDir, "node_modules", "dsh-plugin-a");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "package.json"),
+    JSON.stringify({
+      name: "dsh-plugin-a",
+      dependencies: { "dep-x": "^1.0.0" },
+      dsh: { bundle: { patch: "./cordis.patch.yml" } },
+    }),
+  );
+  // the fake installer materializes dep-x on add
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add" && args[4] === "dep-x") {
+      const depDir = join(profileDir, "node_modules", "dep-x");
+      mkdirSync(depDir, { recursive: true });
+      writeFileSync(join(depDir, "package.json"), JSON.stringify({ name: "dep-x" }));
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const { runner } = fakeRunner();
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, logs } = captureIo({ dshRun, runner, installRunner });
+  const code = await runCli(["doctor", "--fix"], io);
+  assert.equal(code, 0, logs.join("\n"));
+  assert.ok(logs.join("\n").includes("已补装 dep-x"), logs.join("\n"));
+  assert.ok(logs.join("\n").includes("缺失依赖已全部自动修复"));
+});
+
+// ------------------------------------------------------------------ restore
+
+/** Seed a complete snapshot (all three files) under DSH_PKG_HOME. */
+async function seedSnapshot(ts, manifestName = "known-good") {
+  const dir = join(statePath("snapshots"), ts);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "package.json"), JSON.stringify({ name: manifestName }, null, 2));
+  await writeFile(join(dir, "cordis.patch.yml"), "- id: good-entry\n  disabled: false\n");
+  await writeFile(join(dir, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+  return ts;
+}
+
+test("restore restores the newest snapshot by default", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  // snapshot dir names are the SANITIZED form (R4: colons and dots -> dashes)
+  await seedSnapshot("2026-08-30T10-00-00-000Z", "older-good");
+  await seedSnapshot("2026-08-31T10-00-00-000Z", "newest-good");
+  // crash state: manifest corrupted but still a valid profile declaration
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({ corrupted: true, dsh: { profile: true } }),
+  );
+  const { io, logs, errors } = captureIo();
+  const code = await runCli(["restore"], io);
+  assert.equal(code, 0, errors.join("\n"));
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  assert.equal(manifest.name, "newest-good");
+  assert.ok(logs.join("\n").includes("已恢复快照 2026-08-31T10-00-00-000Z"), logs.join("\n"));
+  assert.ok(logs.join("\n").includes("dshpkg run")); // watchdog hint
+});
+
+test("restore accepts an explicit snapshot id", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  await seedSnapshot("2026-08-30T10-00-00-000Z", "older-good");
+  await seedSnapshot("2026-08-31T10-00-00-000Z", "newest-good");
+  const { io, errors } = captureIo();
+  const code = await runCli(["restore", "2026-08-30T10-00-00-000Z"], io);
+  assert.equal(code, 0, errors.join("\n"));
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  assert.equal(manifest.name, "older-good");
+});
+
+test("restore reports no snapshot when none exist", async (t) => {
+  await makeEnv(t);
+  const { io, logs } = captureIo();
+  const code = await runCli(["restore"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("没有可恢复的快照"));
+});
+
+test("restore rejects an unknown snapshot id and lists available ones", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  await seedSnapshot("2026-08-31T10-00-00-000Z", "newest-good");
+  const before = await readFile(join(profileDir, "package.json"), "utf8");
+  const { io, errors } = captureIo();
+  const code = await runCli(["restore", "no-such-ts"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("不存在"));
+  assert.ok(errors.join("\n").includes("2026-08-31T10-00-00-000Z"));
+  // profile untouched
+  assert.equal(await readFile(join(profileDir, "package.json"), "utf8"), before);
+});
+
+test("restore refuses an incomplete snapshot without touching the profile", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  // incomplete snapshot: package.json only (restoreSnapshot is strict)
+  const dir = join(statePath("snapshots"), "2026-08-31T11-00-00-000Z");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "package.json"), JSON.stringify({ name: "incomplete" }));
+  // crash state: manifest corrupted but still a valid profile declaration
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({ corrupted: true, dsh: { profile: true } }),
+  );
+  const { io, errors } = captureIo();
+  const code = await runCli(["restore"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("缺少"), errors.join("\n"));
+  // profile stays in its (corrupted) state: nothing was restored
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  assert.equal(manifest.corrupted, true);
+});
+
+// -------------------------------------------------------- harnessRange gate
+
+test("install rejects a recipe whose harnessRange mismatches the harness", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { harnessRange: "^0.2.0" }),
+  });
+  const { calls, runner } = fakeRunner();
+  const harnessVersionImpl = async () => "0.1.1-rc.2";
+  const { io, errors } = captureIo({ runner, harnessVersionImpl });
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("版本不兼容"), errors.join("\n"));
+  assert.ok(errors.join("\n").includes("--force"));
+  assert.equal(calls.length, 0); // rejected before any dsh command
+});
+
+test("install --force overrides a harnessRange mismatch", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { harnessRange: "^0.2.0" }),
+  });
+  const { calls, runner } = fakeRunner();
+  const harnessVersionImpl = async () => "0.1.1-rc.2";
+  const { io } = captureIo({ runner, harnessVersionImpl });
+  const code = await runCli(["install", "app", "--force"], io);
+  assert.equal(code, 0);
+  assert.ok(calls.some((c) => c[0] === "plugin" && c.includes("add")));
+});
+
+test("install skips the harnessRange check when the harness version is unreadable", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { harnessRange: "^0.2.0" }),
+  });
+  const { runner } = fakeRunner();
+  const harnessVersionImpl = async () => null;
+  const { io, logs } = captureIo({ runner, harnessVersionImpl });
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("跳过 harnessRange 兼容性检查"), logs.join("\n"));
+});
+
+test("install proceeds when the harness version matches the range", async (t) => {
+  await makeEnv(t);
+  await seedRecipeRepo("repo1", {
+    app: recipeOf("app", "app@1.0.0", { harnessRange: "^0.1.0" }),
+  });
+  const { runner } = fakeRunner();
+  const harnessVersionImpl = async () => "0.1.1-rc.2";
+  const { io, errors } = captureIo({ runner, harnessVersionImpl });
+  const code = await runCli(["install", "app"], io);
+  assert.equal(code, 0);
+  assert.ok(!errors.join("\n").includes("版本不兼容"));
+});
+
+// ---------------------------------------------------------------- reconcile
+
+/**
+ * Broken-environment fixture: dsh-plugin-a is installed, declares
+ * dsh.bundle and a missing dep-x, but the official reconciler never
+ * registered it in bundles.
+ */
+async function makeBrokenProfile(t) {
+  const { profileDir } = await makeEnv(t, { deps: { "dsh-plugin-a": "^1.0.0" } });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+  ]);
+  const pkgDir = join(profileDir, "node_modules", "dsh-plugin-a");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "package.json"),
+    JSON.stringify({
+      name: "dsh-plugin-a",
+      version: "1.0.0",
+      dependencies: { "dep-x": "^1.0.0" }, // dep-x is NOT installed
+      dsh: { bundle: { patch: "./cordis.patch.yml" } },
+    }),
+  );
+  return profileDir;
+}
+
+test("reconcile reports problems without touching the profile (no --fix)", async (t) => {
+  const profileDir = await makeBrokenProfile(t);
+  const before = await readFile(join(profileDir, "package.json"), "utf8");
+  const { io, logs } = captureIo();
+  const code = await runCli(["reconcile"], io);
+  assert.equal(code, 1);
+  const text = logs.join("\n");
+  assert.ok(text.includes("未注册的 bundle"), text);
+  assert.ok(text.includes("dsh-plugin-a"));
+  assert.ok(text.includes("dsh-plugin-a 缺少 dep-x"));
+  assert.ok(text.includes("dshpkg reconcile --fix"));
+  // report-only: the manifest is untouched
+  assert.equal(await readFile(join(profileDir, "package.json"), "utf8"), before);
+});
+
+test("reconcile --fix fills missing deps, registers and re-layers", async (t) => {
+  const profileDir = await makeBrokenProfile(t);
+  // The fake installer materializes dep-x on add (transaction verify passes)
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add" && args[4] === "dep-x") {
+      const depDir = join(profileDir, "node_modules", "dep-x");
+      mkdirSync(depDir, { recursive: true });
+      writeFileSync(
+        join(depDir, "package.json"),
+        JSON.stringify({ name: "dep-x", version: "1.0.0" }),
+      );
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const { runner } = fakeRunner();
+  const { io, logs } = captureIo({ runner, installRunner });
+  const code = await runCli(["reconcile", "--fix"], io);
+  assert.equal(code, 0, logs.join("\n"));
+  const text = logs.join("\n");
+  assert.ok(text.includes("补装缺失依赖: dep-x"), text);
+  assert.ok(text.includes("已注册"), text);
+  assert.ok(text.includes("修复完成"), text);
+  // the manifest now carries the registered bundle, layered after guardians
+  const manifest = JSON.parse(await readFile(join(profileDir, "package.json"), "utf8"));
+  const bundles = manifest.dsh.profile.bundles;
+  assert.ok(bundles.includes("dsh-plugin-a"));
+  assert.ok(bundles.indexOf("@deepseek-ai/dsh-web-app") < bundles.indexOf("dsh-plugin-a"));
+});
+
+test("reconcile reports clean when the installed face matches", async (t) => {
+  const { profileDir } = await makeEnv(t, { deps: { "dsh-a": "^1.0.0" } });
+  await withBundles(profileDir, [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "dsh-a",
+  ]);
+  const pkgDir = join(profileDir, "node_modules", "dsh-a");
+  await mkdir(pkgDir, { recursive: true });
+  await writeFile(
+    join(pkgDir, "package.json"),
+    JSON.stringify({
+      name: "dsh-a",
+      version: "1.0.0",
+      dsh: { bundle: { patch: "./cordis.patch.yml" } },
+    }),
+  );
+  const { io, logs } = captureIo();
+  const code = await runCli(["reconcile"], io);
+  assert.equal(code, 0, logs.join("\n"));
+  assert.ok(logs.join("\n").includes("对账一致"));
+});
+
 // ---------------------------------------------------------------------- run
 
 test("run spawns the supervisor via node with stdio inherit", async (t) => {
@@ -1630,4 +2082,96 @@ test("helpText lists every documented command", () => {
   ]) {
     assert.ok(text.includes(cmd), `help must mention ${cmd}`);
   }
+});
+
+// ------------------------------------------- doctor state integrity (R19)
+
+test("doctor reports a healthy state ledger (state/incidents/snapshots)", async (t) => {
+  await makeEnv(t);
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, logs } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 0);
+  assert.ok(logs.join("\n").includes("状态体检: ✓"), logs.join("\n"));
+});
+
+test("doctor flags an incomplete snapshot and --fix quarantines it", async (t) => {
+  const { root } = await makeEnv(t);
+  // snapshot dir missing cordis.patch.yml and pnpm-lock.yaml
+  const snapDir = join(root, "snapshots", "2026-09-01T00-00-00-000Z");
+  await mkdir(snapDir, { recursive: true });
+  await writeFile(join(snapDir, "package.json"), "{}");
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+
+  const probe = captureIo({ dshRun });
+  const codeBad = await runCli(["doctor"], probe.io);
+  assert.equal(codeBad, 1, "an incomplete snapshot fails the health check");
+  assert.ok(probe.errors.join("\n").includes("快照"), probe.errors.join("\n"));
+
+  const fix = captureIo({ dshRun });
+  const codeFix = await runCli(["doctor", "--fix"], fix.io);
+  assert.equal(codeFix, 0, "after quarantine the health check passes");
+  assert.ok(fix.logs.join("\n").includes("状态体检修复"), fix.logs.join("\n"));
+  // quarantined dir carries the .corrupt- suffix; the repair event landed
+  const { readdir: readDir } = await import("node:fs/promises");
+  const snaps = await readDir(join(root, "snapshots"));
+  assert.ok(snaps.some((name) => name.startsWith("2026-09-01T00-00-00-000Z.corrupt-")));
+  const incidents = await readFile(join(root, "incidents.jsonl"), "utf8");
+  assert.ok(incidents.includes('"type":"doctor-repair"'));
+});
+
+test("doctor flags unparsable incident lines (reported, tolerated on read)", async (t) => {
+  const { root } = await makeEnv(t);
+  await writeFile(join(root, "incidents.jsonl"), '{"type":"boot-confirmed"}\nnot-json\n');
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const { io, errors } = captureIo({ dshRun });
+  const code = await runCli(["doctor"], io);
+  assert.equal(code, 1);
+  assert.ok(errors.join("\n").includes("incidents.jsonl 有 1 行不可解析"), errors.join("\n"));
+});
+
+test("doctor flags name drift and --fix rewrites the key to the real name (R20)", async (t) => {
+  const { profileDir } = await makeEnv(t);
+  const manifestPath = join(profileDir, "package.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.dependencies = { "@wrong-key/dsh-x": "link:./x" };
+  manifest.dsh = {
+    profile: {
+      bundles: [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@sentencemang/dshpkg",
+        "@wrong-key/dsh-x",
+      ],
+    },
+  };
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  // installed under the WRONG key, real name differs (the genui failure mode)
+  const fakeDir = join(profileDir, "node_modules", "@wrong-key", "dsh-x");
+  await mkdir(fakeDir, { recursive: true });
+  await writeFile(
+    join(fakeDir, "package.json"),
+    JSON.stringify({ name: "@real-name/dsh-x", version: "1.0.0" }),
+  );
+
+  const dshRun = () => ({ status: 0, stdout: "ok", stderr: "" });
+  const probe = captureIo({ dshRun });
+  const codeBad = await runCli(["doctor"], probe.io);
+  assert.equal(codeBad, 1);
+  assert.ok(
+    probe.errors.join("\n").includes("安装键 @wrong-key/dsh-x 的包真实名称是 @real-name/dsh-x"),
+    probe.errors.join("\n"),
+  );
+
+  const fix = captureIo({ dshRun });
+  const codeFix = await runCli(["doctor", "--fix"], fix.io);
+  assert.equal(codeFix, 0, `${fix.logs.join("\n")}\n${fix.errors.join("\n")}`);
+  assert.ok(
+    fix.logs.join("\n").includes("已改写 @wrong-key/dsh-x -> @real-name/dsh-x"),
+    fix.logs.join("\n"),
+  );
+  const fixed = JSON.parse(await readFile(manifestPath, "utf8"));
+  assert.equal(fixed.dependencies["@real-name/dsh-x"], "link:./x");
+  assert.equal(fixed.dependencies["@wrong-key/dsh-x"], undefined);
+  assert.ok(fixed.dsh.profile.bundles.includes("@real-name/dsh-x"));
 });

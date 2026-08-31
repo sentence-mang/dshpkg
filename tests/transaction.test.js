@@ -3,9 +3,10 @@
 // executed. Profile access goes through DSH_HOME pointing at a temp dir with
 // a synthetic profiles/web; the real ~/.dsh/profiles/web is never touched.
 
-import { test } from "node:test";
+import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,8 +17,21 @@ import {
   remove,
   autoremove,
   defaultRunner,
+  classifyVersionConflict,
+  versionConflictMessage,
 } from "../lib/transaction.js";
 import { resolveDshLauncher, LAUNCHER_SEGMENTS } from "../lib/launcher.js";
+
+// R19: install/remove reorder bundles under the sync lock — give the whole
+// file a temp state root so the real ~/.dsh/dshpkg is never touched.
+let fileStateRoot = null;
+before(async () => {
+  fileStateRoot = await mkdtemp(join(tmpdir(), "dshpkg-tx-filestate-"));
+  if (!process.env.DSH_PKG_HOME) process.env.DSH_PKG_HOME = fileStateRoot;
+});
+after(() => {
+  if (process.env.DSH_PKG_HOME === fileStateRoot) delete process.env.DSH_PKG_HOME;
+});
 
 /** Fake runner: records args, returns {status} from the given script. */
 function fakeRunner(script = () => 0) {
@@ -224,7 +238,9 @@ test("findMissingDeps tolerates a recipe without deps", () => {
 
 test("install runs precheck -> add -> smoke and reports the installed name", async () => {
   const { calls, runner } = fakeRunner();
-  const res = await install("dsh-plugin-x", { runner });
+  // skipReorder keeps this test on the pure command sequence (the bundle
+  // re-layering has its own integration tests below).
+  const res = await install("dsh-plugin-x", { runner, skipReorder: true });
   assert.deepEqual(res, { ok: true, installed: ["dsh-plugin-x"] });
   assert.deepEqual(calls, [
     ["--profile", "web", "--dump-config"],
@@ -240,7 +256,7 @@ test("install installs recipe deps first, then prechecks, then installs self", a
     source: "dsh-plugin-app",
     deps: ["dep-a", { name: "dep-b", source: "npm:dsh-dep-b" }],
   };
-  const res = await install(recipe, { runner });
+  const res = await install(recipe, { runner, skipReorder: true });
   assert.deepEqual(res, { ok: true, installed: ["dep-a", "dep-b", "app"] });
   assert.deepEqual(calls, [
     ["plugin", "--profile", "web", "add", "dep-a"],
@@ -253,7 +269,7 @@ test("install installs recipe deps first, then prechecks, then installs self", a
 
 test("install honors the profile option", async () => {
   const { calls, runner } = fakeRunner();
-  await install("dsh-plugin-x", { profile: "dev", runner });
+  await install("dsh-plugin-x", { profile: "dev", runner, skipReorder: true });
   assert.deepEqual(calls, [
     ["--profile", "dev", "--dump-config"],
     ["plugin", "--profile", "dev", "add", "dsh-plugin-x"],
@@ -263,12 +279,13 @@ test("install honors the profile option", async () => {
 
 test("install forces the link: prefix on local path specs", async () => {
   const { calls, runner } = fakeRunner();
-  await install("C:\\abs\\plugin", { runner });
-  await install("/abs/plugin", { runner });
-  await install("./rel/plugin", { runner });
-  await install("link:C:\\already", { runner });
-  await install("file:C:\\as-file", { runner });
-  await install("dsh-plugin-x@1.2.3", { runner });
+  const opts = { runner, skipReorder: true };
+  await install("C:\\abs\\plugin", opts);
+  await install("/abs/plugin", opts);
+  await install("./rel/plugin", opts);
+  await install("link:C:\\already", opts);
+  await install("file:C:\\as-file", opts);
+  await install("dsh-plugin-x@1.2.3", opts);
 
   // every add command carries the spec as its last arg
   const addSpecs = calls.filter((c) => c[0] === "plugin" && c[3] === "add").map((c) => c[4]);
@@ -443,6 +460,288 @@ test("autoremove fails when the profile is missing", async (t) => {
   assert.equal(res.ok, false);
   assert.match(res.error, /profile/);
   assert.equal(calls.length, 0);
+});
+
+// -------------------------------------------- bundles re-layering (R1 wiring)
+
+/**
+ * Temp profile whose bundles list mimics the official reconciler's append
+ * behavior: kernel first, then everything in install order (guardians and
+ * dependencies out of layer). Fake node_modules manifests carry the bundle
+ * dependency edges.
+ */
+async function makeUnorderedProfile(t) {
+  const home = await mkdtemp(join(tmpdir(), "dshpkg-txn-order-"));
+  process.env.DSH_HOME = home;
+  t.after(() => {
+    delete process.env.DSH_HOME;
+  });
+  const dir = join(home, "profiles", "web");
+  await mkdir(dir, { recursive: true });
+  const manifest = {
+    name: "dsh-profile-web",
+    private: true,
+    dependencies: {
+      "@sentencemang/dshpkg": "link:.",
+      "dsh-boot-guard": "^1.0.0",
+      "dsh-child": "^1.0.0",
+      "dsh-parent": "^1.0.0",
+    },
+    dsh: {
+      profile: {
+        bundles: [
+          "@deepseek-ai/dsh-base",
+          "@deepseek-ai/dsh-web-app",
+          "dsh-child",
+          "dsh-boot-guard",
+          "dsh-parent",
+          "@sentencemang/dshpkg",
+        ],
+      },
+    },
+  };
+  await writeFile(join(dir, "package.json"), JSON.stringify(manifest, null, 2));
+  for (const [name, deps] of [
+    ["dsh-child", { "dsh-parent": "^1.0.0" }],
+    ["dsh-parent", {}],
+    ["dsh-boot-guard", {}],
+    ["@sentencemang/dshpkg", {}],
+  ]) {
+    const pkgDir = join(dir, "node_modules", ...name.split("/"));
+    await mkdir(pkgDir, { recursive: true });
+    await writeFile(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name, version: "1.0.0", dependencies: deps }),
+    );
+  }
+  return { home, dir };
+}
+
+const LAYERED_ORDER = [
+  "@deepseek-ai/dsh-base",
+  "@deepseek-ai/dsh-web-app",
+  "@sentencemang/dshpkg",
+  "dsh-boot-guard",
+  "dsh-parent",
+  "dsh-child",
+];
+
+test("install re-layers dsh.profile.bundles after the smoke passes", async (t) => {
+  const { dir } = await makeUnorderedProfile(t);
+  const { calls, runner } = fakeRunner();
+  const res = await install("dsh-newcomer", { runner });
+  assert.equal(res.ok, true);
+  // command sequence: precheck -> add -> smoke -> post-reorder smoke
+  assert.deepEqual(calls, [
+    ["--profile", "web", "--dump-config"],
+    ["plugin", "--profile", "web", "add", "dsh-newcomer"],
+    ["--profile", "web", "--dump-config"],
+    ["--profile", "web", "--dump-config"],
+  ]);
+  const written = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
+  assert.deepEqual(written.dsh.profile.bundles, LAYERED_ORDER);
+  // unrelated manifest fields survive
+  assert.equal(written.dependencies["dsh-child"], "^1.0.0");
+});
+
+test("install with skipReorder leaves the official bundles order untouched", async (t) => {
+  const { dir } = await makeUnorderedProfile(t);
+  const before = await readFile(join(dir, "package.json"), "utf8");
+  const { calls, runner } = fakeRunner();
+  const res = await install("dsh-newcomer", { runner, skipReorder: true });
+  assert.equal(res.ok, true);
+  assert.equal(await readFile(join(dir, "package.json"), "utf8"), before);
+  // no post-reorder smoke without a re-layering
+  assert.equal(calls.filter((c) => c.includes("--dump-config")).length, 2);
+});
+
+test("install restores the manifest when the re-layered config stops composing", async (t) => {
+  const { dir } = await makeUnorderedProfile(t);
+  const before = await readFile(join(dir, "package.json"), "utf8");
+  let dumpCount = 0;
+  const { runner } = fakeRunner((args) => {
+    if (args.includes("--dump-config")) {
+      dumpCount += 1;
+      return dumpCount === 3 ? 1 : 0; // the POST-reorder smoke fails
+    }
+    return 0;
+  });
+  const res = await install("dsh-newcomer", { runner });
+  // the install itself still succeeds; only the re-layering is reverted
+  assert.equal(res.ok, true);
+  assert.equal(await readFile(join(dir, "package.json"), "utf8"), before);
+});
+
+test("install dryRun never touches the profile manifest", async (t) => {
+  const { dir } = await makeUnorderedProfile(t);
+  const before = await readFile(join(dir, "package.json"), "utf8");
+  const { calls, runner } = fakeRunner();
+  const res = await install("dsh-newcomer", { dryRun: true, runner });
+  assert.equal(res.ok, true);
+  assert.equal(calls.length, 0);
+  assert.equal(await readFile(join(dir, "package.json"), "utf8"), before);
+});
+
+// ---------------------------------------------- version conflict diagnostics
+
+test("classifyVersionConflict recognizes the three pnpm conflict families", () => {
+  assert.equal(
+    classifyVersionConflict("ERR_PNPM_NO_MATCHING_VERSION  dsh-x@99.0.0"),
+    "no-matching-version",
+  );
+  assert.equal(
+    classifyVersionConflict("No matching version found for dsh-x@99.0.0"),
+    "no-matching-version",
+  );
+  assert.equal(
+    classifyVersionConflict("ERR_PNPM_PEER_DEP_ISSUE  something"),
+    "peer-conflict",
+  );
+  assert.equal(
+    classifyVersionConflict("Conflicting peer dependency: react@18.2.0"),
+    "peer-conflict",
+  );
+  assert.equal(
+    classifyVersionConflict("ERR_PNPM_DEP_RESOLUTION  broken tree"),
+    "resolution-conflict",
+  );
+  assert.equal(
+    classifyVersionConflict("unable to resolve dependency tree"),
+    "resolution-conflict",
+  );
+  // non-conflicts are never misclassified
+  assert.equal(classifyVersionConflict("some unrelated error"), null);
+  assert.equal(classifyVersionConflict("allowBuilds pnpm-workspace.yaml"), null);
+  assert.equal(classifyVersionConflict(""), null);
+  assert.equal(classifyVersionConflict(null), null);
+});
+
+test("versionConflictMessage renders actionable Chinese guidance per kind", () => {
+  assert.match(
+    versionConflictMessage("no-matching-version", "dsh-x", "安装失败"),
+    /指定的版本不存在.*dshpkg info dsh-x/,
+  );
+  assert.match(
+    versionConflictMessage("peer-conflict", "dsh-x", "安装失败"),
+    /对等依赖版本冲突.*dshpkg why dsh-x/,
+  );
+  assert.match(
+    versionConflictMessage("resolution-conflict", "dsh-x", "依赖安装失败"),
+    /依赖树无法解析/,
+  );
+  assert.equal(versionConflictMessage("unknown-kind", "dsh-x", "安装失败"), null);
+});
+
+test("install surfaces a Chinese diagnostic on a no-matching-version failure", async () => {
+  const { runner } = fakeRunner();
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add") {
+      return {
+        status: 1,
+        stdout: "",
+        stderr: "ERR_PNPM_NO_MATCHING_VERSION: No matching version found for dsh-plugin-x@99.0.0",
+      };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const res = await install("dsh-plugin-x@99.0.0", { runner, installRunner, skipReorder: true });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /安装失败: dsh-plugin-x/);
+  assert.match(res.error, /指定的版本不存在/);
+  assert.match(res.error, /dshpkg info/);
+});
+
+test("install surfaces a Chinese diagnostic on a peer dependency conflict", async () => {
+  const { runner } = fakeRunner();
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add") {
+      return {
+        status: 1,
+        stdout: "ERR_PNPM_PEER_DEP_ISSUE\nConflicting peer dependency: cordis@3.0.0",
+        stderr: "",
+      };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const res = await install("dsh-plugin-y", { runner, installRunner, skipReorder: true });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /对等依赖版本冲突/);
+  assert.match(res.error, /dshpkg why dsh-plugin-y/);
+});
+
+// ------------------------------------------- active dependency verification
+
+test("install actively fills a missing dependency declared by the target", async (t) => {
+  const { dir } = await makeProfileHome(t, {});
+  const addCalls = [];
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add") {
+      const spec = args[4];
+      addCalls.push(spec);
+      if (spec === "dsh-plugin-target") {
+        // pnpm "installs" the target but leaves dep-x out (the failure mode
+        // dshpkg must not trust)
+        mkdirSync(join(dir, "node_modules", "dsh-plugin-target"), { recursive: true });
+        writeFileSync(
+          join(dir, "node_modules", "dsh-plugin-target", "package.json"),
+          JSON.stringify({ name: "dsh-plugin-target", dependencies: { "dep-x": "^1" } }),
+        );
+      }
+      if (spec === "dep-x") {
+        mkdirSync(join(dir, "node_modules", "dep-x"), { recursive: true });
+        writeFileSync(
+          join(dir, "node_modules", "dep-x", "package.json"),
+          JSON.stringify({ name: "dep-x" }),
+        );
+      }
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const { runner } = fakeRunner();
+  const res = await install("dsh-plugin-target", { runner, installRunner, skipReorder: true });
+  assert.equal(res.ok, true);
+  // the filled dependency is part of the transaction result
+  assert.deepEqual(res.installed, ["dsh-plugin-target", "dep-x"]);
+  assert.deepEqual(addCalls, ["dsh-plugin-target", "dep-x"]);
+});
+
+test("install rolls back when a missing dependency cannot be filled", async (t) => {
+  const { dir } = await makeProfileHome(t, {});
+  const installRunner = (args) => {
+    if (args[0] === "plugin" && args[3] === "add") {
+      const spec = args[4];
+      if (spec === "dsh-plugin-target") {
+        mkdirSync(join(dir, "node_modules", "dsh-plugin-target"), { recursive: true });
+        writeFileSync(
+          join(dir, "node_modules", "dsh-plugin-target", "package.json"),
+          JSON.stringify({ name: "dsh-plugin-target", dependencies: { "dep-x": "^1" } }),
+        );
+      }
+      if (spec === "dep-x") return { status: 1, stdout: "", stderr: "registry down" };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const { calls, runner } = fakeRunner();
+  const res = await install("dsh-plugin-target", { runner, installRunner, skipReorder: true });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /依赖不完整: dsh-plugin-target 缺少 dep-x/);
+  assert.match(res.error, /已尝试补装仍失败/);
+  // the transaction rolls the target back (nothing else was installed)
+  assert.ok(
+    calls.some((c) => c[0] === "plugin" && c[3] === "remove" && c[4] === "dsh-plugin-target"),
+  );
+  assert.equal(res.rolledBack, true);
+});
+
+test("install skips dep verification when the target manifest is unreadable", async (t) => {
+  await makeProfileHome(t, {});
+  // the fake add never materializes node_modules/<target>: verification
+  // degrades to a warning and the install still succeeds
+  const installRunner = () => ({ status: 0, stdout: "", stderr: "" });
+  const { runner } = fakeRunner();
+  const res = await install("dsh-plugin-x", { runner, installRunner, skipReorder: true });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.installed, ["dsh-plugin-x"]);
 });
 
 // --------------------------------------------- default runner shape (dsh launcher)

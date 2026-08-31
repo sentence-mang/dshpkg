@@ -2,6 +2,23 @@
 
 dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [Unreleased] - 测试开发阶段
+
+> ⚠️ 当前处于**测试开发阶段**，尚未完成真实环境端到端验证，接口与行为可能调整。
+
+### 新增
+
+- **bundles 顺序编排**（`lib/order-bundles.js`）：安装后自动重排 `dsh.profile.bundles`——内核 → 守护层 → 依赖拓扑序，修复"新插件追加末尾导致加载时序错乱"的核心问题
+- **bootguard**（`lib/bootguard.js`）：boot 守护层
+- **portcheck**（`lib/portcheck.js`）：端口占用检测与清理
+- **doctor reconcile**：`dshpkg doctor --fix` 校验并修复依赖缺失、注册与分层
+- **install harnessRange 校验**：安装前校验配方与 harness 版本兼容性（`--force` 覆盖）
+- **串行测试脚本**（`scripts/run-tests.js`）：规避 Node 并发 test runner 的偶发 deserialize 问题
+
+### 变更
+
+- `daemon` 命令已移除（dshpkg 不碰系统级注册，守护收敛为 bundle 内进程守护）
+
 ## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 
 ### Breaking Changes（升级注意）

@@ -14,7 +14,8 @@
   },
   "scripts": {
     "check": "node --check lib/index.js && node --check bin/dshpkg.js && node --check bin/supervisor.js",
-    "test": "node --test"
+    "test": "node scripts/run-tests.js",
+    "test:native": "node --test"
   },
   "keywords": [
     "deepseek",

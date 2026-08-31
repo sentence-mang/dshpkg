@@ -33,6 +33,7 @@ test("isProtected: every exact core entry is protected", () => {
     "web-startup",
     "web-runtime",
     "api-gateway",
+    "webserver",
     "dshpkg",
   ]);
 });
@@ -242,6 +243,7 @@ test("supervisor: protected culprit skips disable write and emits protected-bloc
       return child;
     },
     probeImpl: async () => true,
+    portCheckImpl: async () => ({ free: true }),
     sleepImpl: async () => {
       graceCalls += 1;
       const child = children[children.length - 1];
@@ -313,6 +315,7 @@ test("supervisor: non-protected culprit still writes the managed block", async (
       return child;
     },
     probeImpl: async () => true,
+    portCheckImpl: async () => ({ free: true }),
     sleepImpl: async () => {
       graceCalls += 1;
       const child = children[children.length - 1];
@@ -334,4 +337,130 @@ test("supervisor: non-protected culprit still writes the managed block", async (
   const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
   assert.ok(patch.includes("# dshpkg:managed:start"));
   assert.ok(patch.includes("- id: boot-crash-fixture"));
+});
+
+test("supervisor: EADDRINUSE crash disables nothing and restarts (R18)", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "dshpkg-addrinuse-home-"));
+  const profileDir = join(home, "profiles", "web");
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({ name: "web", dsh: { profile: true } }),
+    "utf8",
+  );
+  await writeFile(
+    join(profileDir, "cordis.patch.yml"),
+    "- id: original-entry\n  disabled: false\n",
+    "utf8",
+  );
+  const stateRoot = await mkdtemp(join(tmpdir(), "dshpkg-addrinuse-state-"));
+  await mkdir(join(stateRoot, "snapshots"), { recursive: true });
+
+  const prevHome = process.env.DSH_HOME;
+  const prevPkgHome = process.env.DSH_PKG_HOME;
+  process.env.DSH_HOME = home;
+  process.env.DSH_PKG_HOME = stateRoot;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
+    if (prevPkgHome === undefined) delete process.env.DSH_PKG_HOME;
+    else process.env.DSH_PKG_HOME = prevPkgHome;
+  });
+
+  // First child dies with the real EADDRINUSE output shape (a webserver
+  // listen failure); every later child stays healthy.
+  const children = [];
+  const events = [];
+  let graceCalls = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    portCheckImpl: async () => ({ free: true }),
+    sleepImpl: async () => {
+      graceCalls += 1;
+      const child = children[children.length - 1];
+      if (child && graceCalls === 1) {
+        child.stderr.emit(
+          "data",
+          "failed to apply loader entry webserver (@deepseek-ai/dsh-host-webserver): Error: listen EADDRINUSE: address already in use 127.0.0.1:3080\n",
+        );
+        child.emit("exit", 1, null);
+      }
+    },
+  });
+
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  // The crash is classified as port contention, not a plugin failure.
+  const failed = events.find((e) => e.type === "boot-failed" && e.detail?.reason === "port-busy");
+  assert.ok(failed, "expected a port-busy boot-failed event");
+  assert.equal(events.some((e) => e.type === "protected-blocked"), false);
+  assert.equal(events.some((e) => e.type === "snapshot-restored"), false);
+
+  // Nothing was disabled: no managed block, user content untouched.
+  const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
+  assert.equal(patch.includes("# dshpkg:managed:start"), false);
+  assert.ok(patch.includes("original-entry"));
+});
+
+test("supervisor: busy port held by a stale dsh instance is evicted before spawn (R18)", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "dshpkg-evict-home-"));
+  const profileDir = join(home, "profiles", "web");
+  await mkdir(profileDir, { recursive: true });
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({ name: "web", dsh: { profile: true } }),
+    "utf8",
+  );
+  await writeFile(join(profileDir, "cordis.patch.yml"), "", "utf8");
+  const stateRoot = await mkdtemp(join(tmpdir(), "dshpkg-evict-state-"));
+  await mkdir(join(stateRoot, "snapshots"), { recursive: true });
+
+  const prevHome = process.env.DSH_HOME;
+  const prevPkgHome = process.env.DSH_PKG_HOME;
+  process.env.DSH_HOME = home;
+  process.env.DSH_PKG_HOME = stateRoot;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
+    if (prevPkgHome === undefined) delete process.env.DSH_PKG_HOME;
+    else process.env.DSH_PKG_HOME = prevPkgHome;
+  });
+
+  const events = [];
+  let portChecks = 0;
+  let evictions = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    spawnImpl: async () => fakeChild(),
+    probeImpl: async () => true,
+    sleepImpl: async () => {},
+    // First arbitration round sees a stale dsh instance on the port; the
+    // eviction (injected) frees it.
+    portCheckImpl: async () => {
+      portChecks += 1;
+      return portChecks === 1 ? { free: false, pid: 11100, holder: "node dsh/lib/bin.js web" } : { free: true };
+    },
+    evictImpl: async () => {
+      evictions += 1;
+      return { ok: true, evicted: 1 };
+    },
+  });
+
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  assert.equal(evictions, 1, "the stale holder must be evicted exactly once");
+  const evicted = events.find((e) => e.type === "port-evicted");
+  assert.ok(evicted, "expected a port-evicted event");
 });

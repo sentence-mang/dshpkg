@@ -7,7 +7,7 @@
 // The supervisor is stopped in every loop test via process.emit("SIGINT"),
 // which only fires the registered listener (safe on Windows, no real signal).
 
-import { test } from "node:test";
+import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
@@ -33,7 +33,19 @@ import {
   resetToFactoryBaseline,
   lockfileHashOf,
 } from "../bin/supervisor.js";
-import { readState, writeState } from "../lib/state.js";
+import { readState, writeState, acquireSyncLock, releaseSyncLock, readIncidents } from "../lib/state.js";
+
+// R19: the managed-block writers now take the sync lock. Tests that do not
+// point DSH_PKG_HOME somewhere else must still never touch the real
+// ~/.dsh/dshpkg — give the whole file a temp state root as the default.
+let fileStateRoot = null;
+before(async () => {
+  fileStateRoot = await mkdtemp(join(tmpdir(), "dshpkg-sup-filestate-"));
+  if (!process.env.DSH_PKG_HOME) process.env.DSH_PKG_HOME = fileStateRoot;
+});
+after(() => {
+  if (process.env.DSH_PKG_HOME === fileStateRoot) delete process.env.DSH_PKG_HOME;
+});
 
 // Exact verified message from the Phase 0 PoC (CONTRACTS.md).
 const EXACT_CRASH_TEXT =
@@ -597,6 +609,26 @@ test("writeManagedDisable: drops the [] placeholder together with its comment he
   );
 });
 
+test("writeManagedDisable: under lock contention it degrades but still writes (R19)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
+  await writeFile(join(dir, "cordis.patch.yml"), "[]\n", "utf8");
+  // an external holder (the CLI or another watchdog in reality)
+  assert.deepEqual(await acquireSyncLock(), { ok: true });
+  try {
+    const result = await writeManagedDisable(dir, "crashy");
+    assert.deepEqual(result, { written: true }, "the write must not block on the lock");
+    const text = await readFile(join(dir, "cordis.patch.yml"), "utf8");
+    assert.match(text, /# dshpkg:managed:start/);
+    const incidents = await readIncidents(20);
+    assert.ok(
+      incidents.some((e) => e.type === "lock-busy"),
+      "the contention is observable in the incident stream",
+    );
+  } finally {
+    await releaseSyncLock();
+  }
+});
+
 test("removeManagedBlock: removes only managed blocks, keeps user content", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "dshpkg-sup-patch-"));
   const before =
@@ -715,6 +747,7 @@ test("supervise: healthy wires incident + snapshot side effects (P1-1+P1-3)", as
   const run = supervise({
     profile: "web",
     onEvent: (e) => events.push(e),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -754,6 +787,7 @@ test("supervise: healthy idle window re-invokes the poll hook (P2-4 wiring)", as
   const run = supervise({
     profile: "web",
     onEvent: (e) => events.push(e),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -830,6 +864,7 @@ test("supervise: a drifted lockfile triggers the frozen rebuild (P3-4 wiring)", 
   const run = supervise({
     profile: "web",
     onEvent: (e) => events.push(e),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -870,6 +905,7 @@ test("supervise: healthy child emits healthy, then SIGINT stops it", async (t) =
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -901,6 +937,7 @@ test("supervise: triage hit disables the culprit and restarts", async (t) => {
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -967,6 +1004,7 @@ test("supervise: sync-crash uncaughtException is attributed and disabled", async
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -1056,6 +1094,7 @@ test("supervise: link: junction uncaughtException is attributed via its real pat
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -1132,6 +1171,7 @@ test("supervise: three consecutive failures restore the newest snapshot", async 
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -1176,6 +1216,88 @@ test("supervise: three consecutive failures restore the newest snapshot", async 
   );
 });
 
+test("supervise: three attributed boot-crash fixture failures open the circuit and restore", async (t) => {
+  // The boot-crash fixture variant: every failure IS attributed (loader
+  // error parsed from stderr), so the full P1-2 chain runs end-to-end —
+  // persistCrash x3 -> circuit open persisted -> snapshot restore. The
+  // culprit entry is protected nowhere, so managed disable blocks are
+  // written too; the restore then replaces the patch with the snapshot.
+  const { home, profileDir } = await makeProfileHome(t);
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  // One known-good snapshot (all three manifest files: strict restore).
+  const snap = join(stateRoot, "snapshots", "2026-08-25T08-00-00.000Z");
+  await mkdir(snap, { recursive: true });
+  await writeFile(join(snap, "package.json"), JSON.stringify({ name: "known-good" }), "utf8");
+  await writeFile(join(snap, "cordis.patch.yml"), "- id: good-entry\n  disabled: false\n", "utf8");
+  await writeFile(join(snap, "pnpm-lock.yaml"), "lockfileVersion: 9\n", "utf8");
+
+  const events = [];
+  const children = [];
+  let graceCalls = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => false,
+    // Every child dies with the VERIFIED boot-crash fixture loader message
+    // (the exact kernel format from CONTRACTS.md) — attribution always hits.
+    sleepImpl: async () => {
+      const index = graceCalls;
+      graceCalls += 1;
+      const child = children[index];
+      if (child) {
+        child.stderr.emit("data", NESTED_CRASH_TEXT);
+        child.emit("exit", 1, null);
+      }
+    },
+    // P1-3 trigger ③ runs before every managed disable write: count the
+    // calls, never touch the real snapshot store.
+    snapshotImpl: async () => {},
+  });
+  // Stop right after the circuit-open restore (the loop keeps restarting).
+  await waitFor(() => events.some((e) => e.type === "snapshot-restored"));
+  process.emit("SIGINT");
+  await run;
+
+  // Three attributed failures: the state carries the crash history and the
+  // persisted circuit-open marker (survives a supervisor restart).
+  const state = await readState();
+  const pkg = state.packages["boot-crash-fixture"];
+  assert.equal(pkg.crashCount, 3);
+  assert.equal(pkg.crashTimes.length, 3);
+  assert.equal(typeof pkg.circuitOpenAt, "number");
+
+  // Every boot-failed event attributes the fixture's innermost entry.
+  const bootFailures = events.filter((e) => e.type === "boot-failed" && e.detail?.entryId);
+  assert.ok(bootFailures.length >= 3);
+  assert.ok(bootFailures.every((e) => e.detail.entryId === "boot-crash-fixture"));
+
+  // Circuit opened at failure three and the newest snapshot was restored.
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("circuit-open"));
+  const restored = events.find((e) => e.type === "snapshot-restored");
+  assert.equal(restored.detail.ts, "2026-08-25T08-00-00.000Z");
+  assert.equal(restored.detail.baseline, false);
+
+  // The profile is back to the known-good snapshot content (the managed
+  // disable blocks written on failures one and two are gone with it).
+  assert.deepEqual(
+    JSON.parse(await readFile(join(profileDir, "package.json"), "utf8")),
+    { name: "known-good" },
+  );
+  assert.equal(
+    await readFile(join(profileDir, "cordis.patch.yml"), "utf8"),
+    "- id: good-entry\n  disabled: false\n",
+  );
+});
+
 // --- supervise: probe port resolution ---------------------------------------
 
 test("supervise: probe port comes from --port arg, option, or 3080 default", async (t) => {
@@ -1189,6 +1311,7 @@ test("supervise: probe port comes from --port arg, option, or 3080 default", asy
     spawnImpl: async () => fakeChild(),
     sleepImpl: async () => {},
     onEvent: () => {},
+    portCheckImpl: async () => ({ free: true }),
   };
 
   // case A: --port inside args
@@ -1284,6 +1407,7 @@ test("supervise: explicit port option appends --port to the spawn args", async (
     port: 3199,
     args: [], // no --port pair here: the option must be forwarded on its own
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async (spawnOpts) => {
       spawnCalls.push(spawnOpts);
       return fakeChild();
@@ -1313,6 +1437,7 @@ test("supervise: probe failures kill a hung child and restart it", async (t) => 
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -1345,6 +1470,7 @@ test("supervise: clean exit (code 0) stops the supervisor without triage", async
   const run = supervise({
     profile: "web",
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);
@@ -1384,6 +1510,7 @@ test("supervise: adoptExisting adopts a healthy port, takes over on failure", as
     profile: "web",
     adoptExisting: true,
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     probeImpl: async () => {
       probes += 1;
       if (spawns === 0) {
@@ -1433,6 +1560,7 @@ test("supervise: adoptExisting false (default) never adopts", async (t) => {
     // adoptExisting left at its default (false): a healthy port must still
     // produce a normal spawn — adopt is opt-in via the CLI only.
     onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
     spawnImpl: async () => {
       const child = fakeChild();
       children.push(child);

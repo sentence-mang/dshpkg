@@ -14,7 +14,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rename } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -32,6 +32,10 @@ import {
   resolvePublicKey,
   recordManagedInstall,
   removeManagedEntry,
+  listSnapshots,
+  statePath,
+  withSyncLock,
+  appendIncident,
 } from "../lib/state.js";
 import { search } from "../lib/search.js";
 import {
@@ -54,8 +58,18 @@ import {
   applyDisableToPatch,
   removeManagedBlock,
 } from "../lib/rescue.js";
-import { recipeFromPackageJson, verifyRecipeSig, parseMinisignPublicKey } from "../lib/recipe.js";
-import { saveSnapshot } from "../lib/snapshot.js";
+import { recipeFromPackageJson, verifyRecipeSig, parseMinisignPublicKey, matchesHarnessRange } from "../lib/recipe.js";
+import { saveSnapshot, restoreSnapshot, SNAPSHOT_FILES } from "../lib/snapshot.js";
+import { npmGlobalPrefix, staticNpmPrefixes, LAUNCHER_SEGMENTS } from "../lib/launcher.js";
+import {
+  ensureDshpkgBundle,
+  planReorder,
+  reorderProfileBundles,
+  detectNameDrift,
+  repairNameDrift,
+  DEFAULT_GUARDIANS,
+  KERNEL_PREFIX,
+} from "../lib/order-bundles.js";
 
 // --- constants --------------------------------------------------------------
 
@@ -73,6 +87,37 @@ async function readTextOrEmpty(file) {
   } catch {
     return "";
   }
+}
+
+/**
+ * Resolve the installed dsh harness version (READ-ONLY). Probes the npm
+ * global prefix first (`npm prefix -g` when npm answers; launcher.js already
+ * tolerates its Windows .cmd shim), then the well-known static prefixes; the
+ * first readable @deepseek-ai/dsh manifest wins. Both the prefix probe and
+ * the manifest reader are injectable so tests stay offline. Returns null
+ * when nothing is readable — callers SKIP the compatibility check then.
+ *
+ * @param {{spawnImpl?: Function, readImpl?: Function}} [deps]
+ * @returns {Promise<string|null>} semver string or null
+ */
+export async function resolveHarnessVersion({ spawnImpl, readImpl = readJson } = {}) {
+  const prefixes = [];
+  try {
+    const prefix = npmGlobalPrefix(spawnImpl ? { spawnImpl } : {});
+    if (prefix) prefixes.push(prefix);
+  } catch {
+    // npm unavailable: static prefixes still get probed
+  }
+  for (const p of staticNpmPrefixes()) prefixes.push(p);
+  for (const prefix of prefixes) {
+    const manifest = await readImpl(
+      join(prefix, ...LAUNCHER_SEGMENTS.slice(0, 3), "package.json"),
+      null,
+    );
+    const version = typeof manifest?.version === "string" ? manifest.version.trim() : "";
+    if (version) return version;
+  }
+  return null;
 }
 
 /** Package name of a spec ("dsh-plugin-x@1.2.3" -> "dsh-plugin-x"). */
@@ -534,6 +579,23 @@ async function cmdInstall(ctx, args, opts) {
       }
     }
 
+    // Harness compatibility gate: a recipe declaring harnessRange must match
+    // the installed dsh version. An unreadable harness version SKIPS the
+    // check (never blocks on missing metadata); --force overrides a real
+    // mismatch (explicit user intent).
+    if (recipe && !opts.force && recipe.harnessRange && recipe.harnessRange !== "*") {
+      const harnessVersion = ctx.harnessVersionImpl
+        ? await ctx.harnessVersionImpl()
+        : await resolveHarnessVersion();
+      if (harnessVersion === null) {
+        ctx.log("提示: 无法读取 dsh harness 版本，跳过 harnessRange 兼容性检查");
+      } else if (!matchesHarnessRange(recipe.harnessRange, harnessVersion)) {
+        throw new Error(
+          `配方 ${recipe.name} 声明 harnessRange ${recipe.harnessRange}，当前 harness ${harnessVersion}，版本不兼容（--force 可强制安装）`,
+        );
+      }
+    }
+
     // P3-2: recipe-based installs pass the trust gate (signature check +
     // confirmation card, signing.md §4-5). Direct specs (npm/git) and local
     // paths are explicit user intent and stay ungated; --dry-run never
@@ -914,6 +976,21 @@ async function cmdUpgrade(ctx, args, opts) {
       ctx.log("没有可升级的插件（全部 held 或未安装任何插件）");
       return 0;
     }
+    // R5: snapshot the known-good profile BEFORE touching anything. An
+    // upgrade whose transaction rollback itself failed restores this exact
+    // state; snapshotting is best-effort (a failure only degrades rollback).
+    let snapshotTs = null;
+    let profileDir = null;
+    if (!opts.dryRun) {
+      profileDir = await resolveProfileDir(profile);
+      if (profileDir) {
+        try {
+          snapshotTs = await saveSnapshot(profileDir);
+        } catch (err) {
+          ctx.error(`警告: 升级前快照保存失败（${err?.message ?? err}），回滚能力降级`);
+        }
+      }
+    }
     let failures = 0;
     for (const name of targets) {
       if (isOpen(state, name)) {
@@ -931,6 +1008,17 @@ async function cmdUpgrade(ctx, args, opts) {
       if (!result.ok) {
         ctx.error(`升级失败: ${name}（${result.error}）`);
         failures += 1;
+        // Transaction rollback failed too: the profile is in an uncertain
+        // state — restore the pre-upgrade snapshot and stop upgrading.
+        if (result.rolledBack === false && snapshotTs && profileDir) {
+          const restored = await restoreSnapshot(profileDir, snapshotTs);
+          if (restored.ok) {
+            ctx.log(`已回滚 profile 到升级前快照（${snapshotTs}）`);
+          } else {
+            ctx.error(`快照回滚失败: ${restored.error}（请手动运行 dshpkg doctor）`);
+          }
+          break;
+        }
         continue;
       }
       if (opts.dryRun) ctx.log(`[dry-run] 将升级 ${name}: dsh plugin --profile ${profile} add ${spec}`);
@@ -943,6 +1031,189 @@ async function cmdUpgrade(ctx, args, opts) {
         ctx.log(`✓ ${name} 已升级到最新版本`);
       }
     }
+    return failures === 0 ? 0 : 1;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/**
+ * R2 bootstrap: register dshpkg itself as a bundle in the profile and
+ * re-layer dsh.profile.bundles (kernel -> guardians -> topology), so the
+ * next dsh boot loads dshpkg right after the kernel. This is the ONE
+ * intentional write to a real profile; every other path goes through an
+ * install transaction.
+ */
+async function cmdBootstrap(ctx, _args, opts) {
+  try {
+    const state = await readState();
+    const profile = opts.profile ?? state.profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+    if (!profileDir) {
+      throw new Error(`找不到 profile "${profile}"（目录不存在或没有 dsh.profile 声明）`);
+    }
+    const result = await ensureDshpkgBundle(profileDir);
+    if (!result.ok) throw new Error(result.error);
+    ctx.log(
+      result.added
+        ? `已将 dshpkg 注册到 profile "${profile}" 的 bundles 并重排加载顺序`
+        : `dshpkg 已在 profile "${profile}" 的 bundles 中，已重排加载顺序`,
+    );
+    ctx.log("加载顺序（内核 → 守护 → 依赖拓扑序）:");
+    result.order.forEach((name, i) => ctx.log(`  ${i + 1}. ${name}`));
+    ctx.log("重启 dsh 后生效（dshpkg 将是内核之后第一个加载的插件）");
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/**
+ * One-shot crash rescue: restore a known-good snapshot into the profile
+ * without running the watchdog. No argument restores the NEWEST snapshot;
+ * an explicit snapshot id (see `dshpkg audit` / the list this command
+ * prints) restores that one. restoreSnapshot stays strict: an incomplete
+ * snapshot refuses without touching the profile.
+ */
+async function cmdRestore(ctx, args, opts) {
+  try {
+    const state = await readState();
+    const profile = opts.profile ?? state.profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+    if (!profileDir) {
+      throw new Error(`找不到 profile "${profile}"（目录不存在或没有 dsh.profile 声明）`);
+    }
+    const snapshots = await listSnapshots(); // newest first
+    if (snapshots.length === 0) {
+      ctx.log("没有可恢复的快照（安装/升级成功后会自动保存快照）");
+      return 0;
+    }
+    const target = String(args[0] ?? "").trim() || snapshots[0];
+    if (!snapshots.includes(target)) {
+      ctx.error(`快照 ${target} 不存在，可用快照（新→旧）:`);
+      for (const ts of snapshots) ctx.error(`  - ${ts}`);
+      return 1;
+    }
+    const restored = await restoreSnapshot(profileDir, target);
+    if (!restored.ok) throw new Error(restored.error);
+    ctx.log(`已恢复快照 ${target} 到 profile "${profile}"（重启 dsh 后生效）`);
+    ctx.log("提示: 持续守护请运行 dshpkg run（看门狗自动熔断与快照恢复）");
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+/**
+ * One-shot dependency/registration reconciliation for a broken environment
+ * (crashed boots, plugins installed outside dshpkg, reconciler misses).
+ * The installed face is scanned as the single source of truth and three
+ * problem classes are reported: unregistered bundles, missing declared
+ * deps, and order/registration drift. `--fix` actively fills the missing
+ * deps through the transaction channel, then registers + re-layers.
+ */
+async function cmdReconcile(ctx, _args, opts) {
+  try {
+    const state = await readState();
+    const profile = opts.profile ?? state.profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+    if (!profileDir) {
+      throw new Error(`找不到 profile "${profile}"（目录不存在或没有 dsh.profile 声明）`);
+    }
+    // Scan the installed face: unregistered bundles + missing declared deps.
+    const manifest = await readJson(join(profileDir, "package.json"), null);
+    const depNames = Object.keys(manifest?.dependencies ?? {});
+    const currentBundles = Array.isArray(manifest?.dsh?.profile?.bundles)
+      ? manifest.dsh.profile.bundles
+      : [];
+    const registeredSet = new Set(currentBundles);
+    const unregistered = [];
+    const missingDeps = [];
+    for (const name of depNames) {
+      const depManifest = await readJson(
+        join(profileDir, "node_modules", ...name.split("/"), "package.json"),
+        null,
+      );
+      if (!depManifest) continue; // not materialized on disk: cannot judge
+      if (depManifest?.dsh?.bundle?.patch !== undefined && !registeredSet.has(name)) {
+        unregistered.push(name);
+      }
+      for (const depName of Object.keys(depManifest?.dependencies ?? {})) {
+        if (!existsSync(join(profileDir, "node_modules", ...depName.split("/")))) {
+          missingDeps.push({ pkg: name, dep: depName });
+        }
+      }
+    }
+    // Order/registration drift (dry plan, no write).
+    const plan = await planReorder(profileDir);
+    // R20 name drift: dependency keys whose installed package carries a
+    // different real name break dsh's runtime bundle resolution.
+    const drift = await detectNameDrift(profileDir);
+
+    const problems = unregistered.length + missingDeps.length + drift.length + (plan.changed ? 1 : 0);
+    if (problems === 0) {
+      ctx.log("✓ 依赖与注册对账一致，无需修复");
+      return 0;
+    }
+    if (unregistered.length > 0) {
+      ctx.log(`未注册的 bundle（已安装但未进加载列表）: ${unregistered.join(", ")}`);
+    }
+    if (missingDeps.length > 0) {
+      ctx.log("缺失的依赖:");
+      for (const { pkg, dep } of missingDeps) ctx.log(`  - ${pkg} 缺少 ${dep}`);
+    }
+    if (drift.length > 0) {
+      ctx.log("安装键与包名错配（运行时导入会失败）:");
+      for (const d of drift) ctx.log(`  - 安装键 ${d.key} 的包真实名称是 ${d.realName}`);
+    }
+    if (plan.changed) ctx.log("加载顺序/注册与安装面不一致，需要重排");
+    if (!opts.fix) {
+      ctx.log("运行 dshpkg reconcile --fix 自动修复（改写错配键 + 补装缺失依赖 + 注册 + 重排）");
+      return 1;
+    }
+    // R20 --fix: rewrite drifted keys to the real package names FIRST (dsh
+    // re-links the junctions under the correct names on its next boot).
+    if (drift.length > 0) {
+      const { repaired } = await withSyncLock(() => repairNameDrift(profileDir));
+      for (const r of repaired) ctx.log(`✓ 已改写安装键 ${r}`);
+      if (repaired.length > 0) {
+        await appendIncident({ type: "drift-repaired", detail: repaired.join(", ") });
+      }
+    }
+    // --fix: actively fill missing deps through the transaction channel
+    // (one final re-layer runs afterwards, so per-install reorders skip).
+    let failures = 0;
+    const seen = new Set();
+    for (const { dep } of missingDeps) {
+      if (seen.has(dep)) continue;
+      seen.add(dep);
+      ctx.log(`补装缺失依赖: ${dep}`);
+      const result = await install(dep, {
+        profile,
+        runner: ctx.runner ?? defaultRunner,
+        installRunner: ctx.installRunner ?? ctx.runner ?? defaultRunner,
+        skipReorder: true,
+      });
+      if (!result.ok) {
+        ctx.error(`补装失败: ${dep}（${result.error}）`);
+        failures += 1;
+      }
+    }
+    const reconciled = await reorderProfileBundles(profileDir);
+    if (reconciled.registered.length > 0) {
+      ctx.log(`已注册: ${reconciled.registered.join(", ")}`);
+    }
+    if (reconciled.changed) {
+      ctx.log(`已重排 dsh.profile.bundles（${reconciled.order.length} 个插件）`);
+    }
+    ctx.log(
+      failures === 0
+        ? "修复完成（重启 dsh 后生效；持续守护请运行 dshpkg run）"
+        : `修复完成，但 ${failures} 个依赖补装失败`,
+    );
     return failures === 0 ? 0 : 1;
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
@@ -1005,15 +1276,22 @@ async function setPluginDisabled(ctx, args, opts, disabled) {
       throw new Error(`找不到 profile "${profile}"（目录不存在或缺少 dsh.profile 声明）`);
     }
     const patchFile = join(profileDir, "cordis.patch.yml");
-    const text = await readTextOrEmpty(patchFile);
-    const updated = disabled
-      ? applyDisableToPatch(text, name)
-      : removeManagedBlock(text, name);
-    if (updated === text) {
+    // R19: the patch layer is shared with the watchdog and the in-process
+    // guardian — serialize the read-modify-write under the sync lock.
+    let changed = false;
+    await withSyncLock(async () => {
+      const text = await readTextOrEmpty(patchFile);
+      const updated = disabled
+        ? applyDisableToPatch(text, name)
+        : removeManagedBlock(text, name);
+      if (updated === text) return;
+      await writeFile(patchFile, updated, "utf8");
+      changed = true;
+    });
+    if (!changed) {
       ctx.log(`插件 ${name} 已处于${disabled ? "禁用" : "启用"}状态`);
       return 0;
     }
-    await writeFile(patchFile, updated, "utf8");
     ctx.log(
       `已在 profile "${profile}" 的 cordis.patch.yml 中${disabled ? "禁用" : "启用"} ${name}（重启 dsh 后生效）`,
     );
@@ -1226,40 +1504,245 @@ async function cmdDoctor(ctx, _args, opts) {
     ctx.log(`依赖图检查: ${recipes.length} 个配方, ${problems.length} 处缺失依赖`);
     for (const problem of problems.slice(0, 10)) ctx.error(`  - ${problem}`);
 
+    // Bundle layering check (READ-ONLY): dshpkg must be a declared bundle
+    // and the guardian layer must sit right after the kernel — otherwise
+    // dsh boots dshpkg too late (or never). The fix is `dshpkg bootstrap`.
+    const layerProblems = [];
+    const bundles = Array.isArray(manifest?.dsh?.profile?.bundles)
+      ? manifest.dsh.profile.bundles.filter((n) => typeof n === "string" && n)
+      : [];
+    if (profileDir && bundles.length > 0) {
+      const selfName = DEFAULT_GUARDIANS[0];
+      if (!bundles.includes(selfName)) {
+        layerProblems.push(
+          `${selfName} 未注册到 bundles（dsh 启动不会加载它），运行 dshpkg bootstrap 修复`,
+        );
+      }
+      const guardianPos = DEFAULT_GUARDIANS
+        .map((g) => bundles.indexOf(g))
+        .filter((i) => i >= 0);
+      const plainPos = bundles
+        .map((n, i) =>
+          n.startsWith(KERNEL_PREFIX) || DEFAULT_GUARDIANS.includes(n) ? -1 : i,
+        )
+        .filter((i) => i >= 0);
+      if (
+        guardianPos.length > 0 &&
+        plainPos.length > 0 &&
+        Math.min(...guardianPos) > Math.min(...plainPos)
+      ) {
+        layerProblems.push(
+          "守护层未紧跟内核（有普通插件先于守护加载），运行 dshpkg bootstrap 重排",
+        );
+      }
+    }
+    ctx.log(
+      layerProblems.length === 0
+        ? "bundles 顺序检查: ✓ 守护层位置正确"
+        : `bundles 顺序检查: ${layerProblems.length} 处问题`,
+    );
+    for (const problem of layerProblems) ctx.error(`  - ${problem}`);
+    ctx.log("依赖与注册对账: dshpkg reconcile [--fix]（扫描未注册 bundle 与缺失依赖）");
+    // Boot guardian status (R16): a persistent marker means the previous
+    // boot died before confirmation; the attribution names the culprit the
+    // guardian disabled (fix-broken re-enables it once repaired).
+    const bootMarker = state.boot?.startedAt ?? null;
+    const bootFailures = Number(state.bootFailures) || 0;
+    const lastCulprit = state.boot?.lastCulprit ?? null;
+    ctx.log(
+      `启动守卫: ${bootMarker ? `启动标记存在（${bootMarker}，持续存在说明上次启动异常退出）` : "无启动标记"}，` +
+        `累计启动失败 ${bootFailures} 次` +
+        (lastCulprit ? `，最近归因: ${lastCulprit}（修复后 dshpkg fix-broken 可恢复）` : ""),
+    );
+
+    // R19 state integrity check: state.json must parse as an object, every
+    // incidents.jsonl line must be JSON, and each snapshot dir must carry
+    // the three manifest files. --fix quarantines the damaged items and
+    // records a doctor-repair event; the checks above (readState) already
+    // self-heal a corrupt state.json on read.
+    const healthProblems = [];
+    let stateJsonOk = true;
+    try {
+      const rawState = JSON.parse(await readFile(statePath("state.json"), "utf8"));
+      if (!rawState || typeof rawState !== "object" || Array.isArray(rawState)) {
+        stateJsonOk = false;
+        healthProblems.push("state.json 不是 JSON 对象");
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        stateJsonOk = false;
+        healthProblems.push(`state.json 不可解析: ${err.message}`);
+      }
+    }
+    let badIncidentLines = 0;
+    try {
+      const incidentText = await readFile(statePath("incidents.jsonl"), "utf8");
+      for (const line of incidentText.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          JSON.parse(line);
+        } catch {
+          badIncidentLines += 1;
+        }
+      }
+    } catch {
+      // no incidents file = nothing to check
+    }
+    if (badIncidentLines > 0) {
+      healthProblems.push(`incidents.jsonl 有 ${badIncidentLines} 行不可解析（读取时已容忍，仅提示）`);
+    }
+    const snapshotNames = await listSnapshots();
+    const brokenSnapshots = [];
+    for (const ts of snapshotNames) {
+      const complete = SNAPSHOT_FILES.every((file) =>
+        existsSync(statePath("snapshots", ts, file)),
+      );
+      if (!complete) brokenSnapshots.push(ts);
+    }
+    for (const ts of brokenSnapshots) {
+      healthProblems.push(`快照 ${ts} 缺少文件，无法用于恢复`);
+    }
+    ctx.log(
+      healthProblems.length === 0
+        ? "状态体检: ✓ state / incidents / snapshots 完整"
+        : `状态体检: ${healthProblems.length} 处问题`,
+    );
+    for (const problem of healthProblems) ctx.error(`  - ${problem}`);
+    if (opts.fix && healthProblems.length > 0) {
+      let repaired = 0;
+      let healthUnresolved = healthProblems.length;
+      if (!stateJsonOk) {
+        // readState quarantines the corrupt file and rebuilds defaults.
+        await readState();
+        repaired += 1;
+        healthUnresolved -= 1;
+      }
+      for (const ts of brokenSnapshots) {
+        const src = statePath("snapshots", ts);
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        try {
+          await rename(src, `${src}.corrupt-${stamp}`);
+          repaired += 1;
+          healthUnresolved -= 1;
+        } catch {
+          // a failed quarantine is reported but never fatal
+          ctx.error(`  - 隔离快照 ${ts} 失败，请手动处理`);
+        }
+      }
+      await appendIncident({
+        type: "doctor-repair",
+        detail: healthProblems.join("; "),
+      });
+      ctx.log(`状态体检修复: 已隔离/重建 ${repaired} 项，事件已记录`);
+      // Re-evaluate the exit condition: repaired items no longer count.
+      healthProblems.length = healthUnresolved;
+    }
+
+    // R20 name-drift check: a dependency key different from the installed
+    // package's real name breaks dsh's runtime bundle resolution (the
+    // loader imports the REAL name). --fix rewrites the manifest keys.
+    const drift = profileDir ? await detectNameDrift(profileDir) : [];
+    ctx.log(
+      drift.length === 0
+        ? "包名校验: ✓ 无错配"
+        : `包名校验: ${drift.length} 处错配`,
+    );
+    for (const d of drift) {
+      ctx.error(`  - 安装键 ${d.key} 的包真实名称是 ${d.realName}（dshpkg doctor --fix 可修复）`);
+    }
+    let driftLeft = drift.length;
+    if (opts.fix && drift.length > 0) {
+      ctx.log("自动修复: 改写错配的安装键为真实包名...");
+      const { repaired } = await withSyncLock(() => repairNameDrift(profileDir));
+      for (const r of repaired) ctx.log(`✓ 已改写 ${r}（重启 dsh 后按正确包名重装）`);
+      if (repaired.length > 0) {
+        await appendIncident({ type: "drift-repaired", detail: repaired.join(", ") });
+      }
+      driftLeft = drift.length - repaired.length;
+    }
+
+    // Installed-face integrity: every installed package's declared deps
+    // must exist in node_modules — a missing one is a crash waiting to
+    // happen (load-order errors, missing services).
+    const installedMissing = [];
+    if (profileDir) {
+      for (const name of Object.keys(manifest?.dependencies ?? {})) {
+        const depManifest = await readJson(
+          join(profileDir, "node_modules", ...name.split("/"), "package.json"),
+          null,
+        );
+        if (!depManifest) continue; // not materialized: cannot judge
+        for (const depName of Object.keys(depManifest?.dependencies ?? {})) {
+          if (!existsSync(join(profileDir, "node_modules", ...depName.split("/")))) {
+            installedMissing.push({ pkg: name, dep: depName });
+          }
+        }
+      }
+    }
+    ctx.log(`装机完整性检查: ${installedMissing.length} 处缺失依赖`);
+    for (const { pkg, dep } of installedMissing.slice(0, 10)) {
+      ctx.error(`  - ${pkg} 缺少依赖 ${dep}（运行 dshpkg reconcile --fix 修复）`);
+    }
+
     // --fix: install every missing dependency automatically (no waiting for
     // a human to run install by hand).
-    if (opts.fix && problems.length > 0) {
-      ctx.log("自动修复: 安装缺失依赖...");
-      const recipeByName = new Map(recipes.map(({ recipe: r }) => [r.name, r]));
+    if (opts.fix && (problems.length > 0 || installedMissing.length > 0)) {
       let failures = 0;
-      for (const problem of problems) {
-        const depName = problem.split(" 缺少依赖 ")[1]?.trim();
-        if (!depName) continue;
-        const depRecipe = recipeByName.get(depName);
-        const specOrRecipe = depRecipe
-          ? await expandRecipeClosure(depRecipe)
-          : depName;
-        const result = await install(specOrRecipe, {
-          profile,
-          runner: ctx.runner ?? defaultRunner,
-          installRunner: ctx.installRunner ?? ctx.runner ?? defaultRunner,
-          gitRunner: ctx.gitRunner ?? undefined,
-        });
-        if (!result.ok) {
-          ctx.error(`修复失败: ${depName}（${result.error}）`);
-          failures += 1;
-        } else {
-          ctx.log(`✓ 已安装缺失依赖 ${depName}`);
+      if (problems.length > 0) {
+        ctx.log("自动修复: 安装缺失依赖...");
+        const recipeByName = new Map(recipes.map(({ recipe: r }) => [r.name, r]));
+        for (const problem of problems) {
+          const depName = problem.split(" 缺少依赖 ")[1]?.trim();
+          if (!depName) continue;
+          const depRecipe = recipeByName.get(depName);
+          const specOrRecipe = depRecipe
+            ? await expandRecipeClosure(depRecipe)
+            : depName;
+          const result = await install(specOrRecipe, {
+            profile,
+            runner: ctx.runner ?? defaultRunner,
+            installRunner: ctx.installRunner ?? ctx.runner ?? defaultRunner,
+            gitRunner: ctx.gitRunner ?? undefined,
+          });
+          if (!result.ok) {
+            ctx.error(`修复失败: ${depName}（${result.error}）`);
+            failures += 1;
+          } else {
+            ctx.log(`✓ 已安装缺失依赖 ${depName}`);
+          }
         }
+      }
+      if (installedMissing.length > 0) {
+        ctx.log("自动修复: 补装装机缺失依赖...");
+        const seen = new Set();
+        for (const { dep } of installedMissing) {
+          if (seen.has(dep)) continue;
+          seen.add(dep);
+          const result = await install(dep, {
+            profile,
+            runner: ctx.runner ?? defaultRunner,
+            installRunner: ctx.installRunner ?? ctx.runner ?? defaultRunner,
+            skipReorder: true,
+          });
+          if (!result.ok) {
+            ctx.error(`补装失败: ${dep}（${result.error}）`);
+            failures += 1;
+          } else {
+            ctx.log(`✓ 已补装 ${dep}`);
+          }
+        }
+        await reorderProfileBundles(profileDir);
       }
       if (failures > 0) {
         ctx.error(`仍有 ${failures} 处依赖修复失败`);
         return 1;
       }
       ctx.log("缺失依赖已全部自动修复");
-      return 0;
+      return driftLeft === 0 ? 0 : 1;
     }
-    return problems.length === 0 ? 0 : 1;
+    return problems.length === 0 && layerProblems.length === 0 && installedMissing.length === 0 && healthProblems.length === 0 && driftLeft === 0
+      ? 0
+      : 1;
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
     return 1;
@@ -1314,6 +1797,10 @@ async function cmdAudit(ctx, _args) {
       );
     }
     if (incidents.length === 0) ctx.log("  （暂无）");
+    const snapshots = await listSnapshots();
+    if (snapshots.length > 0) {
+      ctx.log(`崩溃救援: dshpkg restore [快照id]（最新: ${snapshots[0]}）；持续守护请运行 dshpkg run`);
+    }
     return 0;
   } catch (err) {
     ctx.error(`错误: ${err?.message ?? err}`);
@@ -1354,10 +1841,16 @@ async function cmdFixBroken(ctx, args, opts) {
     const profileDir = await resolveProfileDir(profile);
     if (profileDir) {
       const patchFile = join(profileDir, "cordis.patch.yml");
-      const patchText = await readTextOrEmpty(patchFile);
-      const updated = removeManagedBlock(patchText, name);
-      if (updated !== patchText) {
+      // R19: shared surface — serialize under the sync lock.
+      let removedBlock = false;
+      await withSyncLock(async () => {
+        const patchText = await readTextOrEmpty(patchFile);
+        const updated = removeManagedBlock(patchText, name);
+        if (updated === patchText) return;
         await writeFile(patchFile, updated, "utf8");
+        removedBlock = true;
+      });
+      if (removedBlock) {
         ctx.log(`已移除 cordis.patch.yml 中 ${name} 的禁用块（重启 dsh 后生效）`);
       } else {
         ctx.log(`cordis.patch.yml 中没有 ${name} 的禁用块，无需清理`);
@@ -1511,6 +2004,9 @@ export const COMMANDS = new Map([
   ["why", cmdWhy],
   ["doctor", cmdDoctor],
   ["autoremove", cmdAutoremove],
+  ["bootstrap", cmdBootstrap],
+  ["restore", cmdRestore],
+  ["reconcile", cmdReconcile],
   ["audit", cmdAudit],
   ["fix-broken", cmdFixBroken],
   ["log", cmdLog],
@@ -1543,7 +2039,12 @@ export function helpText() {
     "  list                      列出插件（--installed 仅看已安装）",
     "  info <名称>               配方详情、依赖与崩溃计数",
     "  why <名称>                依赖反查：哪些配方依赖它",
-    "  doctor [--fix]             校验组合树与依赖图（--fix 自动安装缺失依赖）",
+    "  doctor [--fix]             校验组合树、依赖图与状态台账完整性（--fix 自动安装缺失依赖并隔离损坏项）",
+    "  bootstrap                 注册 dshpkg 到 profile bundles 并重排加载顺序",
+    "                            （内核 → 守护 → 依赖拓扑序；重启 dsh 后生效）",
+    "  restore [快照id]           崩溃一键救援: 恢复快照到 profile（缺省恢复最新）",
+    "  reconcile [--fix]         依赖/注册对账: 扫描未注册 bundle 与缺失依赖",
+    "                            （--fix 主动补装 + 注册 + 重排）",
     "  autoremove                 清理孤儿包（被卸载插件的残留依赖；--dry-run 演练）",
     "  audit                     最近 20 条崩溃记录 + 电路状态汇总",
     "  fix-broken                交互式修复 circuit-open 的插件",
@@ -1588,6 +2089,7 @@ const KNOWN_FLAGS = new Set([
   "--fix",
   "--now",
   "--check",
+  "--force",
 ]);
 
 /**
@@ -1610,6 +2112,7 @@ export function parseArgs(argv) {
     fix: false,
     now: false,
     check: false,
+    force: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -1656,6 +2159,10 @@ export function parseArgs(argv) {
     }
     if (arg === "--check") {
       opts.check = true;
+      continue;
+    }
+    if (arg === "--force") {
+      opts.force = true;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {
@@ -1723,7 +2230,7 @@ export function defaultDshRun(args, deps = {}) {
  * every call); in production the add steps use the capturing install runner
  * so pnpm output (allowBuilds hints, network errors) can be inspected.
  */
-function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner } = {}) {
+function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner, harnessVersionImpl } = {}) {
   const resolvedRunner = runner ?? defaultRunner;
   const askInjected = typeof ask === "function";
   return {
@@ -1740,6 +2247,7 @@ function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spaw
     spawnImpl: spawnImpl ?? null,
     search: search ?? null, // injectable search (smart install; tests)
     gitRunner: gitRunner ?? null, // injectable git runner (search-derived github: specs)
+    harnessVersionImpl: harnessVersionImpl ?? null, // injectable harness version probe (harnessRange gate)
   };
 }
 
