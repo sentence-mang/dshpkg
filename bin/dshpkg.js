@@ -883,7 +883,7 @@ async function cmdDaemon(ctx, args, opts) {
     const sub = String(args[0] ?? "").trim();
     const profile = opts.profile ?? (await readState()).profile ?? "web";
     const cmd = daemonCommand(profile);
-    const runner = ctx.runner ?? (opts.system ? schtasksRunner : regRunner);
+    const runner = ctx.daemonRunner ?? (opts.system ? schtasksRunner : regRunner);
     if (sub === "install") {
       if (opts.system) {
         // schtasks path: two tasks (logon + keep-alive), admin required.
@@ -1908,7 +1908,7 @@ export function defaultDshRun(args, deps = {}) {
  * every call); in production the add steps use the capturing install runner
  * so pnpm output (allowBuilds hints, network errors) can be inspected.
  */
-function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner } = {}) {
+function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spawnImpl, search, gitRunner, daemonRunner } = {}) {
   const resolvedRunner = runner ?? defaultRunner;
   const askInjected = typeof ask === "function";
   return {
@@ -1920,6 +1920,7 @@ function makeCtx({ log, error, ask, runner, installRunner, dshRun, fetcher, spaw
     canPrompt: askInjected || process.stdin.isTTY === true,
     runner: resolvedRunner,
     installRunner: installRunner ?? (runner ? resolvedRunner : defaultInstallRunner),
+    daemonRunner: daemonRunner ?? null, // injectable daemon OS-call runner (tests)
     dshRun: dshRun ?? defaultDshRun,
     fetcher: fetcher ?? null,
     spawnImpl: spawnImpl ?? null,

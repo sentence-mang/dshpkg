@@ -536,11 +536,11 @@ test("self-upgrade reports a failed apply without rolling back (P4-2)", async (t
 test("daemon install registers the HKCU Run key (no elevation) by default", async (t) => {
   await makeEnv(t);
   const calls = [];
-  const runner = (args) => {
+  const daemonRunner = (args) => {
     calls.push([...args]);
     return { status: 0 };
   };
-  const { io, logs } = captureIo({ runner });
+  const { io, logs } = captureIo({ daemonRunner });
   const code = await runCli(["daemon", "install"], io);
   assert.equal(code, 0);
   // Default path: a single reg add to the HKCU Run key.
@@ -558,11 +558,11 @@ test("daemon install registers the HKCU Run key (no elevation) by default", asyn
 test("daemon install --system uses schtasks (logon + keep-alive)", async (t) => {
   await makeEnv(t);
   const calls = [];
-  const runner = (args) => {
+  const daemonRunner = (args) => {
     calls.push([...args]);
     return { status: 0 };
   };
-  const { io } = captureIo({ runner });
+  const { io } = captureIo({ daemonRunner });
   const code = await runCli(["daemon", "install", "--system"], io);
   assert.equal(code, 0);
   const creates = calls.filter((c) => c.includes("/Create"));
@@ -575,8 +575,8 @@ test("daemon install --system uses schtasks (logon + keep-alive)", async (t) => 
 
 test("daemon install reports failure when the Run key registration fails", async (t) => {
   await makeEnv(t);
-  const runner = () => ({ status: 1, stderr: "boom" });
-  const { io, errors } = captureIo({ runner });
+  const daemonRunner = () => ({ status: 1, stderr: "boom" });
+  const { io, errors } = captureIo({ daemonRunner });
   const code = await runCli(["daemon", "install"], io);
   assert.equal(code, 1);
   assert.ok(errors.join("\n").includes("开机自启失败"), errors.join("\n"));
@@ -585,11 +585,11 @@ test("daemon install reports failure when the Run key registration fails", async
 test("daemon uninstall deletes the HKCU Run value by default", async (t) => {
   await makeEnv(t);
   const calls = [];
-  const runner = (args) => {
+  const daemonRunner = (args) => {
     calls.push([...args]);
     return { status: 0 };
   };
-  const { io, logs } = captureIo({ runner });
+  const { io, logs } = captureIo({ daemonRunner });
   const code = await runCli(["daemon", "uninstall"], io);
   assert.equal(code, 0);
   const dels = calls.filter((c) => c[0] === "delete");
@@ -601,10 +601,10 @@ test("daemon uninstall deletes the HKCU Run value by default", async (t) => {
 test("daemon status reflects the HKCU Run key registration", async (t) => {
   await makeEnv(t);
   // Registered -> 0.
-  const { io } = captureIo({ runner: () => ({ status: 0 }) });
+  const { io } = captureIo({ daemonRunner: () => ({ status: 0 }) });
   assert.equal(await runCli(["daemon", "status"], io), 0);
   // Not registered -> 1.
-  const { io: io2 } = captureIo({ runner: () => ({ status: 1 }) });
+  const { io: io2 } = captureIo({ daemonRunner: () => ({ status: 1 }) });
   assert.equal(await runCli(["daemon", "status"], io2), 1);
 });
 
