@@ -114,7 +114,7 @@ dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
 
-## CLI 命令（31 个命令入口）
+## CLI 命令（32 个命令入口）
 
 | 命令 | 说明 |
 | --- | --- |
@@ -144,6 +144,7 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 | `repo remove/list` | 移除 / 列出配方仓库 |
 | `key add/list/remove` | 信任 / 列出 / 移除 minisign 公钥（配方签名验签） |
 | `optimize [--apply]` | 性能诊断：测量组合耗时、标记高负载/不稳定插件、报告缓存占用；`--apply` 自动禁用不稳定插件 |
+| `heal [--yes] [--upgrade]` | 崩溃自愈诊断：归因分类+建议动作（`--yes` 执行安全可逆动作并逐一校验、失败回滚；`--upgrade` 走事务升级） |
 | `help` | 显示帮助 |
 
 常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`、`--yes`（非交互确认）。
@@ -164,6 +165,17 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 3. **核心保护名单**：`loader` / `include` / `cordis-host-runner` 等核心条目**永不熔断**——熔断核心只会让 harness 彻底无法启动，因此 host 服务与看门狗都会拒绝（`protected-blocked` 事件）
 
 自愈的每一步都会写入事件流（`incidents.jsonl`），`dshpkg log` 随时可查。
+
+## 崩溃自愈诊断（heal）
+
+`dshpkg heal` 在崩溃无法启动时**自动检查问题、归因分类、给出可逆修复**（吸收 2026-09-03 事故教训——bootguard 盲禁 gateway 引发 workspaceRegistry 连锁全链路崩溃）：
+
+- **诊断（默认，零改动）**：汇总 `incidents.jsonl` 崩溃证据 → 规则式分类（`upgrade-incompat` API/版本不兼容 / `service-pending` 服务未就绪 / `missing-package` 缺依赖 / `session-format` 会话格式 / `fixture` 测试夹具 / `unknown`）→ 高频嫌疑条目 → 建议动作清单
+- **安全动作（`--yes`）**：仅执行可证明安全的动作；`disable` 类**逐一校验**（`--dump-config`）+ 失败自动回滚；再经 `lib/depsafe.js` 依赖感知防护——会波及基线内依赖方的禁用被拒绝并转人工
+- **升级式修复（`--upgrade`）**：`upgrade-incompat` 类崩溃走事务升级肇事插件而非禁用（最稳，直接治本）
+- **诚实边界**：`service-pending` 建议排查服务提供者而非禁用依赖方；`session-format` / `unknown` 转人工
+
+关键设计：**分类器对真实事故**（gateway authority 崩溃 → upgrade 而非 disable；workspaceRegistry pending → check-service 而非 disable）已验证不误伤。
 
 ## 性能优化（optimize）
 
