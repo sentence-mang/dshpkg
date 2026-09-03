@@ -56,6 +56,8 @@ import {
 } from "../lib/rescue.js";
 import { recipeFromPackageJson, verifyRecipeSig, parseMinisignPublicKey } from "../lib/recipe.js";
 import { saveSnapshot } from "../lib/snapshot.js";
+import { measureCompose, scorePlugins, dirSize, cacheStats, mb, sampleMemory, memoryBudget } from "../lib/perf.js";
+import { budgetLevel, evictionPlan } from "../lib/governor.js";
 
 // --- constants --------------------------------------------------------------
 
@@ -1508,6 +1510,87 @@ async function cmdLog(ctx, _args) {
   }
 }
 
+async function cmdOptimize(ctx, args, opts) {
+  try {
+    const state = await readState();
+    const profile = opts.profile ?? state.profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+
+    ctx.log(`[性能诊断] profile: ${profile}`);
+
+    // 1) compose cost
+    const comp = await measureCompose(profile, { dshRun: ctx.dshRun });
+    ctx.log(`组合耗时(--dump-config): ${comp.ok ? `${comp.ms}ms` : "失败"}${comp.ok ? "" : `（${comp.error ?? "?"}）`}`);
+
+    // 2) cache usage
+    const cache = await cacheStats();
+    ctx.log(`缓存占用: 快照 ${cache.snapshotCount} 份 ${mb(cache.snapshotsBytes)}MB · git ${mb(cache.gitBytes)}MB · managed ${mb(cache.managedBytes)}MB · index ${mb(cache.indexBytes)}MB（共 ${mb(cache.totalBytes)}MB）`);
+
+    // 3) plugin sizes + scoring
+    const sizes = {};
+    if (profileDir) {
+      for (const name of Object.keys(state.packages ?? {})) {
+        const s = await dirSize(join(profileDir, "node_modules", name));
+        if (s > 0) sizes[name] = s;
+      }
+    }
+    const scores = scorePlugins(state, { sizes });
+
+    // 4) memory budget governance
+    const budgetMb = opts.budget && opts.budget > 0 ? opts.budget * 1024 * 1024 : undefined;
+    const mem = await sampleMemory();
+    const b = memoryBudget({ memory: mem, budget: budgetMb });
+    const level = budgetLevel({ rss: b.rss, budget: b.budget });
+    ctx.log(`内存: RSS ${mb(b.rss)}MB / 预算 ${mb(b.budget)}MB（${b.pct}%）档位 ${level}${b.over ? "（超预算）" : ""}`);
+    const plan = evictionPlan({ rss: b.rss, budget: b.budget, scores });
+    if (plan.actions.length > 0) {
+      ctx.log(`建议禁用以释放内存（${plan.actions.length} 个）: ${plan.actions.map((a) => a.name).join("、")}`);
+      if (!opts.apply) ctx.log("提示: 加 --apply 自动禁用（写 cordis.patch.yml 禁用块，重启后生效，可逆）。");
+    }
+
+    // 5) unstable plugin report
+    const unstable = scores.filter(
+      (e) => (e.circuitOpen || e.crashCount >= 3) && !e.held && !isProtected(e.name),
+    );
+    const top = scores.filter((e) => e.score > 0).slice(0, 8);
+    if (top.length === 0) ctx.log("未发现高负载/不稳定插件，当前配置较健康。");
+    else {
+      ctx.log(`高负载/不稳定插件 Top ${top.length}:`);
+      for (const e of top) ctx.log(`  ${e.name}（评分 ${e.score}）: ${e.reasons.join("、") || "—"}`);
+    }
+    if (unstable.length > 0) {
+      ctx.log(`建议禁用的不稳定插件（${unstable.length} 个）: ${unstable.map((e) => e.name).join("、")}`);
+      if (!opts.apply) ctx.log("提示: 加 --apply 自动禁用（写 cordis.patch.yml 禁用块，重启后生效，可逆）。");
+    }
+
+    // 6) --apply: disable unstable + red-zone memory relief (file mode, reversible)
+    if (opts.apply) {
+      const targets = [...unstable.map((e) => e.name), ...plan.actions.map((a) => a.name)];
+      const uniq = [...new Set(targets)];
+      if (uniq.length > 0) {
+        if (!profileDir) throw new Error(`找不到 profile "${profile}"（目录不存在或缺少 dsh.profile 声明）`);
+        const patchFile = join(profileDir, "cordis.patch.yml");
+        let text = await readTextOrEmpty(patchFile);
+        let changed = 0;
+        for (const name of uniq) {
+          const updated = applyDisableToPatch(text, name);
+          if (updated !== text) { text = updated; changed += 1; }
+        }
+        if (changed > 0) {
+          await writeFile(patchFile, text, "utf8");
+          ctx.log(`已禁用 ${changed} 个插件（写入 ${profile} 的 cordis.patch.yml，重启 dsh 后生效；dshpkg enable <名称> 可恢复）`);
+        } else {
+          ctx.log("这些插件已在禁用状态，无需改动。");
+        }
+      }
+    }
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
 async function cmdRun(ctx, _args, opts) {
   try {
     const supervisorJs = join(dirname(fileURLToPath(import.meta.url)), "supervisor.js");
@@ -1637,6 +1720,7 @@ export const COMMANDS = new Map([
   ["audit", cmdAudit],
   ["fix-broken", cmdFixBroken],
   ["log", cmdLog],
+  ["optimize", cmdOptimize],
   ["run", cmdRun],
   ["repo", cmdRepo],
   ["key", cmdKey],
@@ -1670,6 +1754,8 @@ export function helpText() {
     "  doctor [--fix]             校验组合树与依赖图（--fix 自动安装缺失依赖）",
     "  autoremove                 清理孤儿包（被卸载插件的残留依赖；--dry-run 演练）",
     "  audit                     最近 20 条崩溃记录 + 电路状态汇总",
+    "  optimize [--apply] [--budget <MB>]",
+    "                            性能诊断与优化：组合耗时、内存预算(默认500MB)、高负载/不稳定插件、缓存占用；--apply 自动禁用",
     "  fix-broken                交互式修复 circuit-open 的插件",
     "  log                       输出崩溃事件流（incidents.jsonl）",
     "  run                       启动看门狗守护 dsh（--port N / --profile 名）",
@@ -1715,6 +1801,8 @@ const KNOWN_FLAGS = new Set([
   "--fix",
   "--now",
   "--check",
+  "--apply",
+  "--budget",
 ]);
 
 /**
@@ -1737,6 +1825,8 @@ export function parseArgs(argv) {
     fix: false,
     now: false,
     check: false,
+    apply: false,
+    budget: null,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -1783,6 +1873,22 @@ export function parseArgs(argv) {
     }
     if (arg === "--check") {
       opts.check = true;
+      continue;
+    }
+    if (arg === "--apply") {
+      opts.apply = true;
+      continue;
+    }
+    if (arg === "--budget" && argv[i + 1] !== undefined) {
+      const value = Number(argv[++i]);
+      if (!Number.isFinite(value) || value <= 0) throw new Error("--budget 必须是正数（MB）");
+      opts.budget = value;
+      continue;
+    }
+    if (arg.startsWith("--budget=")) {
+      const value = Number(arg.slice("--budget=".length));
+      if (!Number.isFinite(value) || value <= 0) throw new Error("--budget 必须是正数（MB）");
+      opts.budget = value;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {
