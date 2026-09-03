@@ -61,6 +61,7 @@ import { measureCompose, scorePlugins, dirSize, cacheStats, mb, sampleMemory, me
 import { budgetLevel, evictionPlan } from "../lib/governor.js";
 import { collectBootEvidence, suggestAction } from "../lib/diag.js";
 import { heal, executablePlan } from "../lib/selfheal.js";
+import { reverseDeps, activeBaseline, guardDisable } from "../lib/depsafe.js";
 
 // --- constants --------------------------------------------------------------
 
@@ -1633,7 +1634,7 @@ async function cmdHeal(ctx, _args, opts) {
     }
 
     if (opts.yes) {
-      const plan = executablePlan(suggestions);
+      let plan = executablePlan(suggestions);
       if (plan.length === 0) {
         ctx.log("没有可自动执行的动作（其余需人工或 --upgrade）。");
         return 0;
@@ -1641,6 +1642,26 @@ async function cmdHeal(ctx, _args, opts) {
       const profileDir = await resolveProfileDir(profile);
       if (!profileDir) throw new Error(`找不到 profile "${profile}"（目录不存在或缺少 dsh.profile 声明）`);
       const patchFile = join(profileDir, "cordis.patch.yml");
+
+      // Dependency-aware guard (Phase 2): refuse auto-disable that would
+      // cascade into baseline dependents; the refused ones go to manual.
+      const reverse = await reverseDeps(profileDir);
+      const knownEntries = Object.keys(state.packages ?? {});
+      const baseline = activeBaseline({ incidents, knownEntries });
+      const guardedPlan = [];
+      const guardedOut = [];
+      for (const action of plan) {
+        if (action.kind === "disable") {
+          const g = guardDisable(action.name, { reverse, baseline, isProtected });
+          if (!g.allowed) {
+            guardedOut.push({ kind: "manual", name: action.name, reason: g.risk.join("；") });
+            for (const r of g.risk) ctx.log(`  ⛔ [secure] ${action.name}: ${r}（跳过自动禁用）`);
+            continue;
+          }
+        }
+        guardedPlan.push(action);
+      }
+      plan = guardedPlan;
       const applyDisable = async (name) => {
         const text = await readTextOrEmpty(patchFile);
         const updated = applyDisableToPatch(text, name);
@@ -1672,8 +1693,9 @@ async function cmdHeal(ctx, _args, opts) {
         const status = a.ok ? "✓" : "✗";
         ctx.log(`  ${status} [${a.kind}] ${a.name}${a.rolledBack ? "（已回滚）" : ""}${a.error ? `: ${a.error}` : ""}`);
       }
-      if (out.needsManual.length > 0) {
-        ctx.log(`需人工处理: ${out.needsManual.map((m) => m.name || m.kind).join("、")}`);
+      const allManual = [...out.needsManual, ...guardedOut];
+      if (allManual.length > 0) {
+        ctx.log(`需人工处理: ${allManual.map((m) => m.name || m.kind).join("、")}`);
       }
       ctx.log(out.verified ? "自愈动作全部通过校验。" : "部分动作未通过校验，已回滚，请人工介入。");
     } else {
