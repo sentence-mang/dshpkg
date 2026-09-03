@@ -178,6 +178,15 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 - **安全与可逆**：`--apply` 只写 `cordis.patch.yml` 禁用块，**不做删除/卸载**；核心保护名单条目永不禁用；恢复用 `dshpkg enable <名称>`
 - **与其它命令的分工**：`audit` 看崩溃记录、`optimize` 看性能与负载、`doctor` 校验依赖
 
+### 资源治理（Resource Governor，`lib/governor.js`）
+
+面向「插件再多也稳、内存占用可预期」的目标，dshpkg 提供插件维度的资源治理决策层：
+
+- **内存预算治理**：默认预算 **500 MB**（`DEFAULT_MEMORY_BUDGET`，可配置）。采样 dsh 进程 RSS，按 `绿(<70%) / 黄(<100%) / 红(≥100%)` 分档；红区时给出**可逆的卸载建议**（最重、空闲、非保护、非 held 的插件优先），实际禁用只发生在显式 `--apply` 或宿主配置开启时。
+- **启动顺序编排**：`composeBundleOrder` 把 dsh.profile.bundles 重排为「守护/基础层前置 + 依赖拓扑排序」，解决「装插件越多加载顺序越乱、越容易崩」的根因；环与未知依赖只追加不丢弃。
+- **边界**：只治理 dsh 自身进程内存与自身插件集合，不写系统注册、不常驻服务、不硬性截杀进程——500MB 是治理预算而非强制上限。
+- 接线（CLI 标志、宿主定时采样、install 后 bundles 重排）见 `OPTIMIZE-GOVERNOR.md`，属集成阶段。
+
 ## 模型工具与安装守卫
 
 dshpkg 在宿主内注册 3 个模型工具，让 AI 智能体以受控方式操作插件：

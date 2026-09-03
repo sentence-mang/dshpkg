@@ -7,6 +7,8 @@ dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-
 - 新增 `dshpkg optimize [--apply]` 性能诊断命令：测量 dsh 组合耗时（`--dump-config`，只组合不启动，安全）、插件稳定性/体积打分（熔断 +60、崩溃次数、体积 ≥20MB 加重）、缓存占用分解（快照/git/managed/index）
 - 标记不稳定插件（circuit-open 或崩溃 ≥3 次）；`--apply` 自动禁用不稳定插件（写 `cordis.patch.yml` 禁用块，可逆，`dshpkg enable <名称>` 恢复，核心保护名单跳过）
 - 新增 `lib/perf.js` 模块（measureCompose / scorePlugins / dirSize / cacheStats / mb，零依赖、纯函数可注入测试）
+- 新增 `lib/governor.js` 资源治理模块（纯决策）：`budgetLevel`（绿/黄/红内存分档，默认预算 500MB）、`reliefCandidates` / `evictionPlan`（红区可逆卸载建议，保护/held 永不动）、`composeBundleOrder`（bundle 加载顺序编排：守护/基础层前置 + 依赖拓扑排序，环与未知依赖只追加不丢弃）；`lib/perf.js` 补充 `sampleMemory` / `memoryBudget` 内存测量
+- 接线规格（CLI 内存治理标志、宿主定时采样、install 后 bundles 重排）见 `OPTIMIZE-GOVERNOR.md`
 
 ## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 
