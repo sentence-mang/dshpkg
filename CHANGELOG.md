@@ -27,6 +27,7 @@ dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-
 
 - incidents 事件流统一时间戳字段（writer 单写 `t`，去掉调用方冗余 `at`）
 - lock-busy 事件带 `lock` 字段标识锁类型（sync / supervisor），消除 audit/log 上无法区分锁源的噪音
+- **supervisor 崩溃自动禁用接入 depsafe 反向依赖防护**：写禁用块前检查声明依赖方，有基线内依赖方时拒绝盲禁（emit `guarded-disable`，跳过快照与禁用写入，可 upgrade/人工处理），堵住 09-03 gateway 连锁事故在崩溃循环中的重演窗口
 
 ## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 

@@ -981,6 +981,81 @@ test("supervise: triage hit disables the culprit and restarts", async (t) => {
   assert.equal(children.length, 2);
 });
 
+test("supervise: a culprit with a declared dependent is NOT auto-disabled (depsafe guard)", async (t) => {
+  const { home, profileDir } = await makeProfileHome(t);
+  // Give the culprit a declared dependent ON THE INSTALLED FACE so the
+  // dependency-aware guard (depsafe) refuses the blind auto-disable that
+  // caused the 2026-09-03 gateway cascading-crash incident.
+  await mkdir(join(profileDir, "node_modules", "dependant-entry"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(profileDir, "node_modules", "dependant-entry", "package.json"),
+    JSON.stringify({
+      name: "dependant-entry",
+      version: "1.0.0",
+      dependencies: { "boot-crash-fixture": "1.0.0" },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(profileDir, "package.json"),
+    JSON.stringify({
+      name: "web",
+      dependencies: { "dependant-entry": "1.0.0" },
+      dsh: { profile: { bundles: ["boot-crash-fixture", "dependant-entry"] } },
+    }),
+    "utf8",
+  );
+  const stateRoot = await makeStateRoot(t);
+  useTempEnv(t, { home, stateRoot });
+
+  const events = [];
+  const children = [];
+  let graceCalls = 0;
+  const run = supervise({
+    profile: "web",
+    onEvent: (event) => events.push(event),
+    portCheckImpl: async () => ({ free: true }),
+    spawnImpl: async () => {
+      const child = fakeChild();
+      children.push(child);
+      return child;
+    },
+    probeImpl: async () => true,
+    // First child crashes with the culprit on stderr; later children stay up.
+    sleepImpl: async () => {
+      const index = graceCalls;
+      graceCalls += 1;
+      const child = children[index];
+      if (child && index === 0) {
+        child.stderr.emit("data", NESTED_CRASH_TEXT);
+        child.emit("exit", 1, null);
+      }
+    },
+  });
+  await waitFor(() => events.some((e) => e.type === "healthy"));
+  process.emit("SIGINT");
+  await run;
+
+  // The guard refuses the disable → no managed block is ever written.
+  const patch = await readFile(join(profileDir, "cordis.patch.yml"), "utf8");
+  assert.doesNotMatch(patch, /# dshpkg:managed:start/);
+  assert.doesNotMatch(patch, /boot-crash-fixture/);
+
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("guarded-disable"), "guard refuses the blind disable");
+  assert.ok(types.includes("boot-failed"));
+  assert.ok(types.includes("healthy"));
+  const guarded = events.find((e) => e.type === "guarded-disable");
+  assert.equal(guarded.detail.entryId, "boot-crash-fixture");
+  assert.ok(
+    String((guarded.detail.risk ?? []).join("")).includes("波及"),
+    "risk explains the dependants",
+  );
+  assert.equal(children.length, 2, "the restart loop still recovers");
+});
+
 // --- supervise: uncaughtException stack attribution (sync-crash) ------------
 
 test("supervise: sync-crash uncaughtException is attributed and disabled", async (t) => {

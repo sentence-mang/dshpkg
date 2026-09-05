@@ -39,6 +39,7 @@ import {
   withSyncLock,
 } from "../lib/state.js";
 import { isProtected } from "../lib/protect.js";
+import { reverseDeps, activeBaseline, guardDisable } from "../lib/depsafe.js";
 import { isEntrylessPatch, restoreEmptyArray } from "../lib/rescue.js";
 import { resolveDshLauncher } from "../lib/launcher.js";
 import { recordCrash, isDangerousKey } from "../lib/circuit.js";
@@ -316,6 +317,43 @@ async function resolvePackageRealPaths(profileDir, pkgName, depValue) {
     }
   }
   return [...paths];
+}
+
+/**
+ * Collect the bare entry ids a profile currently declares (package.json
+ * `dependencies` + `dsh.profile.bundles`, link:/file:/version suffixes
+ * stripped) — the "known entry set" the depsafe baseline uses for disable
+ * decisions, independent of the loader's runtime view. Never throws: an
+ * unreadable profile degrades to [] so the watchdog itself stays responsive.
+ *
+ * @param {string} profileDir absolute profile directory
+ * @returns {Promise<string[]>}
+ */
+export async function collectEntryIds(profileDir) {
+  const ids = [];
+  const push = (name) => {
+    const bare = String(name ?? "")
+      .trim()
+      .replace(/^(link:|file:)/, "")
+      .replace(/@[^@/]+$/, "");
+    if (bare && !ids.includes(bare)) ids.push(bare);
+  };
+  try {
+    const manifest = await readJson(join(profileDir, "package.json"), null);
+    if (!manifest || typeof manifest !== "object") return ids;
+    const deps =
+      manifest.dependencies && typeof manifest.dependencies === "object"
+        ? manifest.dependencies
+        : {};
+    for (const key of Object.keys(deps)) push(key);
+    const bundles = Array.isArray(manifest?.dsh?.profile?.bundles)
+      ? manifest.dsh.profile.bundles
+      : [];
+    for (const raw of bundles) push(raw);
+  } catch {
+    // a broken profile must never block attribution
+  }
+  return ids;
 }
 
 /**
@@ -1145,22 +1183,43 @@ export async function supervise(
           // managed disable block write is skipped for protected entries.
           emit("protected-blocked", { entryId: culprit.entryId });
         } else {
-          // P1-3 trigger ③: snapshot BEFORE the disable write, so the
-          // restore path can roll the managed block back. Awaited on
-          // purpose: the snapshot must be complete before the patch
-          // changes, or a restore could capture the disabled state.
-          try {
-            await snapshotImpl(profileDir);
-          } catch {
-            // a broken snapshot store must not block the disable write
-          }
-          try {
-            await writeManagedDisable(profileDir, culprit.entryId);
-          } catch (err) {
-            emit("boot-failed", {
-              reason: "managed-write",
-              message: String(err?.message ?? err),
+          // Dependency-aware guard (09-03 gateway lesson, feat/optimize
+          // integration): refuse the auto-disable when a declared entry
+          // depends on the culprit — a blind disable would re-cascade the
+          // tree (reverseDeps/activeBaseline/guardDisable, all pure, never
+          // throw). A refused disable skips the snapshot + marker write and
+          // runs the restart/circuit loop like a protected entry.
+          const knownEntries = await collectEntryIds(profileDir);
+          const reverse = await reverseDeps(profileDir).catch(() => ({}));
+          const baseline = activeBaseline({ knownEntries });
+          const guard = guardDisable(culprit.entryId, {
+            reverse,
+            baseline,
+            isProtected,
+          });
+          if (!guard.allowed) {
+            emit("guarded-disable", {
+              entryId: culprit.entryId,
+              risk: guard.risk,
             });
+          } else {
+            // P1-3 trigger ③: snapshot BEFORE the disable write, so the
+            // restore path can roll the managed block back. Awaited on
+            // purpose: the snapshot must be complete before the patch
+            // changes, or a restore could capture the disabled state.
+            try {
+              await snapshotImpl(profileDir);
+            } catch {
+              // a broken snapshot store must not block the disable write
+            }
+            try {
+              await writeManagedDisable(profileDir, culprit.entryId);
+            } catch (err) {
+              emit("boot-failed", {
+                reason: "managed-write",
+                message: String(err?.message ?? err),
+              });
+            }
           }
         }
       }
@@ -1303,6 +1362,11 @@ function consoleReporter(profile, port) {
       case "protected-blocked":
         console.error(
           `[dshpkg] 肇事条目 "${detail.entryId ?? "?"}" 是核心条目，受保护，已跳过禁用标记（继续重启循环）`,
+        );
+        break;
+      case "guarded-disable":
+        console.error(
+          `[dshpkg] 肇事条目 "${detail.entryId ?? "?"}" 有声明依赖方，自动禁用被拒（${(detail.risk ?? []).slice(0, 3).join("、") || "反向依赖已萌芽"}）；跳过禁用标记，请 upgrade 或人工排查`,
         );
         break;
       default:
