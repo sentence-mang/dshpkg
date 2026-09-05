@@ -1,0 +1,18 @@
+{
+  "name": "dshpkg",
+  "kind": "bundle",
+  "source": {
+    "type": "git",
+    "spec": "github:sentence-mang/dshpkg"
+  },
+  "deps": [],
+  "harnessRange": "*",
+  "pin": {
+    "allow": true
+  },
+  "description": "DeepSeek Harness 的 apt 式插件管理器：配方仓库、事务安装/回滚、崩溃熔断、watchdog 自愈、依赖感知禁用防护",
+  "maintainer": "sentence-mang",
+  "homepage": "https://github.com/sentence-mang/dshpkg",
+  "license": "MIT",
+  "tags": ["plugin-manager", "core", "self-hosted"]
+}
