@@ -118,7 +118,7 @@ dshpkg install github:owner/repo#path:packages/sub   # 只装 monorepo 子包
 git config --global url."git@github.com:".insteadOf "https://github.com/"
 ```
 
-## CLI 命令（30 个命令入口）
+## CLI 命令（32 个命令入口）
 
 | 命令 | 说明 |
 | --- | --- |
@@ -147,6 +147,8 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 | `repo add <url> [名称] [--format git\|index]` | 添加配方仓库（`--format index` = 发布者静态索引源） |
 | `repo remove/list` | 移除 / 列出配方仓库 |
 | `key add/list/remove` | 信任 / 列出 / 移除 minisign 公钥（配方签名验签） |
+| `optimize [--apply]` | 性能诊断：测量组合耗时、标记高负载/不稳定插件、报告缓存占用；`--apply` 自动禁用不稳定插件 |
+| `heal [--yes] [--upgrade]` | 崩溃自愈诊断：归因分类+建议动作（`--yes` 执行安全可逆动作并逐一校验、失败回滚；`--upgrade` 走事务升级） |
 | `help` | 显示帮助 |
 
 常用选项：`--online`（search 联网）、`--dry-run`（只演练不改动）、`--profile <名>`、`--port <N>`、`--yes`（非交互确认）。
@@ -167,6 +169,39 @@ git config --global url."git@github.com:".insteadOf "https://github.com/"
 3. **核心保护名单**：`loader` / `include` / `cordis-host-runner` 等核心条目**永不熔断**——熔断核心只会让 harness 彻底无法启动，因此 host 服务与看门狗都会拒绝（`protected-blocked` 事件）
 
 自愈的每一步都会写入事件流（`incidents.jsonl`），`dshpkg log` 随时可查。
+
+## 崩溃自愈诊断（heal）
+
+`dshpkg heal` 在崩溃无法启动时**自动检查问题、归因分类、给出可逆修复**（吸收 2026-09-03 事故教训——bootguard 盲禁 gateway 引发 workspaceRegistry 连锁全链路崩溃）：
+
+- **诊断（默认，零改动）**：汇总 `incidents.jsonl` 崩溃证据 → 规则式分类（`upgrade-incompat` API/版本不兼容 / `service-pending` 服务未就绪 / `missing-package` 缺依赖 / `session-format` 会话格式 / `fixture` 测试夹具 / `unknown`）→ 高频嫌疑条目 → 建议动作清单
+- **安全动作（`--yes`）**：仅执行可证明安全的动作；`disable` 类**逐一校验**（`--dump-config`）+ 失败自动回滚；再经 `lib/depsafe.js` 依赖感知防护——会波及基线内依赖方的禁用被拒绝并转人工
+- **升级式修复（`--upgrade`）**：`upgrade-incompat` 类崩溃走事务升级肇事插件而非禁用（最稳，直接治本）
+- **诚实边界**：`service-pending` 建议排查服务提供者而非禁用依赖方；`session-format` / `unknown` 转人工
+
+关键设计：**分类器对真实事故**（gateway authority 崩溃 → upgrade 而非 disable；workspaceRegistry pending → check-service 而非 disable）已验证不误伤。
+
+## 性能优化（optimize）
+
+`dshpkg optimize` 用于诊断 dsh 使用中的卡顿，定位高负载与不稳定的插件，并可选自动禁用它们：
+
+- **用法**：`dshpkg optimize`（只诊断，不改动）；`dshpkg optimize --apply`（诊断 + 自动禁用不稳定插件）
+- **做了什么**：
+  - 测量 dsh 组合耗时（`--dump-config`，只组合不启动，安全）
+  - 按稳定性/体积给插件打分：熔断（circuit-open +60 分）、崩溃次数、体积 ≥20MB 加重
+  - 缓存占用分解：快照 / git / managed / index
+  - 标记不稳定插件（circuit-open 或崩溃 ≥3 次）
+- **安全与可逆**：`--apply` 只写 `cordis.patch.yml` 禁用块，**不做删除/卸载**；核心保护名单条目永不禁用；恢复用 `dshpkg enable <名称>`
+- **与其它命令的分工**：`audit` 看崩溃记录、`optimize` 看性能与负载、`doctor` 校验依赖
+
+### 资源治理（Resource Governor，`lib/governor.js`）
+
+面向「插件再多也稳、内存占用可预期」的目标，dshpkg 提供插件维度的资源治理决策层：
+
+- **内存预算治理**：默认预算 **500 MB**（`DEFAULT_MEMORY_BUDGET`，可配置）。采样 dsh 进程 RSS，按 `绿(<70%) / 黄(<100%) / 红(≥100%)` 分档；红区时给出**可逆的卸载建议**（最重、空闲、非保护、非 held 的插件优先），实际禁用只发生在显式 `--apply` 或宿主配置开启时。
+- **启动顺序编排**：`composeBundleOrder` 把 dsh.profile.bundles 重排为「守护/基础层前置 + 依赖拓扑排序」，解决「装插件越多加载顺序越乱、越容易崩」的根因；环与未知依赖只追加不丢弃。
+- **边界**：只治理 dsh 自身进程内存与自身插件集合，不写系统注册、不常驻服务、不硬性截杀进程——500MB 是治理预算而非强制上限。
+- 接线（CLI 标志、宿主定时采样、install 后 bundles 重排）见 `OPTIMIZE-GOVERNOR.md`，属集成阶段。
 
 ## 模型工具与安装守卫
 

@@ -324,7 +324,9 @@ test("withSyncLock degrades on contention: fn still runs, lock-busy recorded", a
   assert.equal(ran, true, "the guarded operation must still run unlocked");
   assert.equal(result, "done");
   const incidents = await readIncidents(10);
-  assert.ok(incidents.some((e) => e.type === "lock-busy"), "lock-busy incident recorded");
+  const busy = incidents.find((e) => e.type === "lock-busy");
+  assert.ok(busy, "lock-busy incident recorded");
+  assert.equal(busy.lock, "sync", "lock-busy incident carries the lock kind (sync)");
   await releaseSyncLock();
 });
 

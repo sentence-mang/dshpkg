@@ -23,6 +23,7 @@ import {
   readState,
   writeState,
   readIncidents,
+  appendIncident,
   resolveProfileDir,
   readJson,
   readApiToken,
@@ -35,7 +36,6 @@ import {
   listSnapshots,
   statePath,
   withSyncLock,
-  appendIncident,
 } from "../lib/state.js";
 import { search } from "../lib/search.js";
 import {
@@ -70,6 +70,11 @@ import {
   DEFAULT_GUARDIANS,
   KERNEL_PREFIX,
 } from "../lib/order-bundles.js";
+import { measureCompose, scorePlugins, dirSize, cacheStats, mb, sampleMemory, memoryBudget } from "../lib/perf.js";
+import { budgetLevel, evictionPlan } from "../lib/governor.js";
+import { collectBootEvidence, suggestAction } from "../lib/diag.js";
+import { heal, executablePlan } from "../lib/selfheal.js";
+import { reverseDeps, activeBaseline, guardDisable } from "../lib/depsafe.js";
 
 // --- constants --------------------------------------------------------------
 
@@ -1878,6 +1883,200 @@ async function cmdLog(ctx, _args) {
   }
 }
 
+async function cmdOptimize(ctx, args, opts) {
+  try {
+    const state = await readState();
+    const profile = opts.profile ?? state.profile ?? "web";
+    const profileDir = await resolveProfileDir(profile);
+
+    ctx.log(`[性能诊断] profile: ${profile}`);
+
+    // 1) compose cost
+    const comp = await measureCompose(profile, { dshRun: ctx.dshRun });
+    ctx.log(`组合耗时(--dump-config): ${comp.ok ? `${comp.ms}ms` : "失败"}${comp.ok ? "" : `（${comp.error ?? "?"}）`}`);
+
+    // 2) cache usage
+    const cache = await cacheStats();
+    ctx.log(`缓存占用: 快照 ${cache.snapshotCount} 份 ${mb(cache.snapshotsBytes)}MB · git ${mb(cache.gitBytes)}MB · managed ${mb(cache.managedBytes)}MB · index ${mb(cache.indexBytes)}MB（共 ${mb(cache.totalBytes)}MB）`);
+
+    // 3) plugin sizes + scoring
+    const sizes = {};
+    if (profileDir) {
+      for (const name of Object.keys(state.packages ?? {})) {
+        const s = await dirSize(join(profileDir, "node_modules", name));
+        if (s > 0) sizes[name] = s;
+      }
+    }
+    const scores = scorePlugins(state, { sizes });
+
+    // 4) memory budget governance
+    const budgetMb = opts.budget && opts.budget > 0 ? opts.budget * 1024 * 1024 : undefined;
+    const mem = await sampleMemory();
+    const b = memoryBudget({ memory: mem, budget: budgetMb });
+    const level = budgetLevel({ rss: b.rss, budget: b.budget });
+    ctx.log(`内存: RSS ${mb(b.rss)}MB / 预算 ${mb(b.budget)}MB（${b.pct}%）档位 ${level}${b.over ? "（超预算）" : ""}`);
+    const plan = evictionPlan({ rss: b.rss, budget: b.budget, scores });
+    if (plan.actions.length > 0) {
+      ctx.log(`建议禁用以释放内存（${plan.actions.length} 个）: ${plan.actions.map((a) => a.name).join("、")}`);
+      if (!opts.apply) ctx.log("提示: 加 --apply 自动禁用（写 cordis.patch.yml 禁用块，重启后生效，可逆）。");
+    }
+
+    // 5) unstable plugin report
+    const unstable = scores.filter(
+      (e) => (e.circuitOpen || e.crashCount >= 3) && !e.held && !isProtected(e.name),
+    );
+    const top = scores.filter((e) => e.score > 0).slice(0, 8);
+    if (top.length === 0) ctx.log("未发现高负载/不稳定插件，当前配置较健康。");
+    else {
+      ctx.log(`高负载/不稳定插件 Top ${top.length}:`);
+      for (const e of top) ctx.log(`  ${e.name}（评分 ${e.score}）: ${e.reasons.join("、") || "—"}`);
+    }
+    if (unstable.length > 0) {
+      ctx.log(`建议禁用的不稳定插件（${unstable.length} 个）: ${unstable.map((e) => e.name).join("、")}`);
+      if (!opts.apply) ctx.log("提示: 加 --apply 自动禁用（写 cordis.patch.yml 禁用块，重启后生效，可逆）。");
+    }
+
+    // 6) --apply: disable unstable + red-zone memory relief (file mode, reversible)
+    if (opts.apply) {
+      const targets = [...unstable.map((e) => e.name), ...plan.actions.map((a) => a.name)];
+      const uniq = [...new Set(targets)];
+      if (uniq.length > 0) {
+        if (!profileDir) throw new Error(`找不到 profile "${profile}"（目录不存在或缺少 dsh.profile 声明）`);
+        const patchFile = join(profileDir, "cordis.patch.yml");
+        let text = await readTextOrEmpty(patchFile);
+        let changed = 0;
+        for (const name of uniq) {
+          const updated = applyDisableToPatch(text, name);
+          if (updated !== text) { text = updated; changed += 1; }
+        }
+        if (changed > 0) {
+          await writeFile(patchFile, text, "utf8");
+          ctx.log(`已禁用 ${changed} 个插件（写入 ${profile} 的 cordis.patch.yml，重启 dsh 后生效；dshpkg enable <名称> 可恢复）`);
+        } else {
+          ctx.log("这些插件已在禁用状态，无需改动。");
+        }
+      }
+    }
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
+async function cmdHeal(ctx, _args, opts) {
+  try {
+    const state = await readState();
+    const incidents = await readIncidents(2000);
+    const profile = opts.profile ?? state.profile ?? "web";
+    const ev = collectBootEvidence({ incidents, state });
+
+    ctx.log(`[崩溃自愈诊断] 共 ${ev.total} 条事件，其中 ${ev.crashes.length} 条崩溃相关`);
+    ctx.log(`上次成功启动: ${ev.lastBootOkAt ?? "未知"} · bootFailures=${ev.bootFailures}`);
+    if (ev.topCulprits.length > 0) ctx.log(`高频嫌疑条目: ${ev.topCulprits.join("、")}`);
+    const clazzLines = Object.entries(ev.classCounts).filter(([, n]) => n > 0);
+    if (clazzLines.length > 0) {
+      ctx.log(`崩溃分类: ${clazzLines.map(([c, n]) => `${c}(${n})`).join("、")}`);
+    }
+
+    // suggestions from the most recent crashes, deduped by kind+name
+    const suggestions = [];
+    const seen = new Set();
+    for (const crash of ev.crashes.slice(-12).reverse()) {
+      const culprit = crash.culprits[0] ?? "";
+      const act = suggestAction(crash.clazz, { name: culprit });
+      const key = `${act.kind}:${culprit}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      suggestions.push({ ...act, name: culprit, clazz: crash.clazz });
+    }
+
+    if (suggestions.length === 0) {
+      ctx.log("最近未发现可归因的崩溃，配置健康。");
+      return 0;
+    }
+
+    ctx.log(`建议动作（${suggestions.length} 项）:`);
+    for (const s of suggestions) {
+      const target = s.name ? ` ${s.name}` : "";
+      ctx.log(`  [${s.kind}]${target}: ${s.reason}`);
+    }
+
+    if (opts.yes) {
+      let plan = executablePlan(suggestions);
+      if (plan.length === 0) {
+        ctx.log("没有可自动执行的动作（其余需人工或 --upgrade）。");
+        return 0;
+      }
+      const profileDir = await resolveProfileDir(profile);
+      if (!profileDir) throw new Error(`找不到 profile "${profile}"（目录不存在或缺少 dsh.profile 声明）`);
+      const patchFile = join(profileDir, "cordis.patch.yml");
+
+      // Dependency-aware guard (Phase 2): refuse auto-disable that would
+      // cascade into baseline dependents; the refused ones go to manual.
+      const reverse = await reverseDeps(profileDir);
+      const knownEntries = Object.keys(state.packages ?? {});
+      const baseline = activeBaseline({ incidents, knownEntries });
+      const guardedPlan = [];
+      const guardedOut = [];
+      for (const action of plan) {
+        if (action.kind === "disable") {
+          const g = guardDisable(action.name, { reverse, baseline, isProtected });
+          if (!g.allowed) {
+            guardedOut.push({ kind: "manual", name: action.name, reason: g.risk.join("；") });
+            for (const r of g.risk) ctx.log(`  ⛔ [secure] ${action.name}: ${r}（跳过自动禁用）`);
+            continue;
+          }
+        }
+        guardedPlan.push(action);
+      }
+      plan = guardedPlan;
+      const applyDisable = async (name) => {
+        const text = await readTextOrEmpty(patchFile);
+        const updated = applyDisableToPatch(text, name);
+        if (updated !== text) await writeFile(patchFile, updated, "utf8");
+      };
+      const removeBlock = async (name) => {
+        const text = await readTextOrEmpty(patchFile);
+        const updated = removeManagedBlock(text, name);
+        if (updated !== text) await writeFile(patchFile, updated, "utf8");
+      };
+      const upgradePkg = async (name) => {
+        if (opts.upgrade && name) {
+          const res = await install(name, { profile });
+          if (!res.ok) throw new Error(res.error ?? "升级失败");
+        } else {
+          throw new Error("--upgrade 未开启，跳过升级型动作");
+        }
+      };
+      const out = await heal({
+        profile,
+        plan,
+        dshRun: ctx.dshRun,
+        applyDisable,
+        removeBlock,
+        upgradePkg,
+        incident: appendIncident,
+      });
+      for (const a of out.actions) {
+        const status = a.ok ? "✓" : "✗";
+        ctx.log(`  ${status} [${a.kind}] ${a.name}${a.rolledBack ? "（已回滚）" : ""}${a.error ? `: ${a.error}` : ""}`);
+      }
+      const allManual = [...out.needsManual, ...guardedOut];
+      if (allManual.length > 0) {
+        ctx.log(`需人工处理: ${allManual.map((m) => m.name || m.kind).join("、")}`);
+      }
+      ctx.log(out.verified ? "自愈动作全部通过校验。" : "部分动作未通过校验，已回滚，请人工介入。");
+    } else {
+      ctx.log("提示: 加 --yes 可自动执行 [disable] 类安全动作（逐一校验、失败回滚）；--upgrade 让 [upgrade] 类动作走事务升级。");
+    }
+    return 0;
+  } catch (err) {
+    ctx.error(`错误: ${err?.message ?? err}`);
+    return 1;
+  }
+}
+
 async function cmdRun(ctx, _args, opts) {
   try {
     const supervisorJs = join(dirname(fileURLToPath(import.meta.url)), "supervisor.js");
@@ -2010,6 +2209,8 @@ export const COMMANDS = new Map([
   ["audit", cmdAudit],
   ["fix-broken", cmdFixBroken],
   ["log", cmdLog],
+  ["optimize", cmdOptimize],
+  ["heal", cmdHeal],
   ["run", cmdRun],
   ["repo", cmdRepo],
   ["key", cmdKey],
@@ -2047,6 +2248,9 @@ export function helpText() {
     "                            （--fix 主动补装 + 注册 + 重排）",
     "  autoremove                 清理孤儿包（被卸载插件的残留依赖；--dry-run 演练）",
     "  audit                     最近 20 条崩溃记录 + 电路状态汇总",
+    "  optimize [--apply] [--budget <MB>]",
+    "                            性能诊断与优化：组合耗时、内存预算(默认500MB)、高负载/不稳定插件、缓存占用；--apply 自动禁用",
+    "  heal [--yes] [--upgrade]   崩溃自愈诊断：归因分类+建议动作（--yes 执行安全可逆动作并逐一校验，--upgrade 走事务升级）",
     "  fix-broken                交互式修复 circuit-open 的插件",
     "  log                       输出崩溃事件流（incidents.jsonl）",
     "  run                       启动看门狗守护 dsh（--port N / --profile 名）",
@@ -2089,7 +2293,10 @@ const KNOWN_FLAGS = new Set([
   "--fix",
   "--now",
   "--check",
-  "--force",
+"--force",
+  "--apply",
+  "--budget",
+  "--upgrade",
 ]);
 
 /**
@@ -2112,7 +2319,10 @@ export function parseArgs(argv) {
     fix: false,
     now: false,
     check: false,
-    force: false,
+force: false,
+    apply: false,
+    budget: null,
+    upgrade: false,
   };
   let passthrough = false;
   for (let i = 0; i < argv.length; i += 1) {
@@ -2161,8 +2371,28 @@ export function parseArgs(argv) {
       opts.check = true;
       continue;
     }
-    if (arg === "--force") {
+if (arg === "--force") {
       opts.force = true;
+      continue;
+    }
+    if (arg === "--apply") {
+      opts.apply = true;
+      continue;
+    }
+    if (arg === "--upgrade") {
+      opts.upgrade = true;
+      continue;
+    }
+    if (arg === "--budget" && argv[i + 1] !== undefined) {
+      const value = Number(argv[++i]);
+      if (!Number.isFinite(value) || value <= 0) throw new Error("--budget 必须是正数（MB）");
+      opts.budget = value;
+      continue;
+    }
+    if (arg.startsWith("--budget=")) {
+      const value = Number(arg.slice("--budget=".length));
+      if (!Number.isFinite(value) || value <= 0) throw new Error("--budget 必须是正数（MB）");
+      opts.budget = value;
       continue;
     }
     if (arg === "--profile" && argv[i + 1] !== undefined) {

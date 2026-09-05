@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateKeyPairSync, sign } from "node:crypto";
 
-import { runCli, parseArgs, helpText, HOST_PORT, defaultDshRun } from "../bin/dshpkg.js";
+import { runCli, parseArgs, helpText, COMMANDS, HOST_PORT, defaultDshRun } from "../bin/dshpkg.js";
 import {
   readState,
   writeState,
@@ -202,6 +202,15 @@ test("-h and --help both print the full help", async () => {
     assert.ok(logs.join("\n").includes("install <名称"));
     assert.ok(logs.join("\n").includes("fix-broken"));
   }
+});
+
+test("COMMANDS wires the integrated diagnostics commands (optimize / heal)", async () => {
+  await makeEnv(globalThis);
+  assert.equal(typeof COMMANDS.get("optimize"), "function", "optimize command wired into COMMANDS");
+  assert.equal(typeof COMMANDS.get("heal"), "function", "heal command wired into COMMANDS");
+  const text = helpText();
+  assert.ok(text.includes("optimize"), "help text lists optimize");
+  assert.ok(text.includes("heal"), "help text lists heal");
 });
 
 test("unknown command prints Chinese help and exits 2", async () => {

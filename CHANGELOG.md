@@ -13,11 +13,20 @@ dshpkg 版本记录。格式：[Keep a Changelog](https://keepachangelog.com/zh-
 - **portcheck**（`lib/portcheck.js`）：端口占用检测与清理
 - **doctor reconcile**：`dshpkg doctor --fix` 校验并修复依赖缺失、注册与分层
 - **install harnessRange 校验**：安装前校验配方与 harness 版本兼容性（`--force` 覆盖）
+- **`dshpkg optimize [--apply] [--budget <MB>]`** 性能诊断：组合耗时测量（`--dump-config` 只组合不启动）、插件稳定性/体积打分（熔断 +60、崩溃次数、体积 ≥20MB 加重）、缓存占用分解（快照/git/managed/index）；`--apply` 自动禁用不稳定/红区插件（写 `cordis.patch.yml` 禁用块，可逆，核心保护名单跳过）
+- **`dshpkg heal [--yes] [--upgrade]`** 崩溃自愈诊断：证据归因分类（upgrade-incompat / service-pending / missing-package / session-format / fixture / unknown）+ 建议动作；`--yes` 执行安全可逆动作并逐一校验、失败回滚；`--upgrade` 走事务升级
+- 新模块：`lib/perf.js`（measureCompose / scorePlugins / dirSize / cacheStats，零依赖纯函数）、`lib/governor.js`（budgetLevel 绿/黄/红内存分档、reliefCandidates / evictionPlan 红区卸载建议、composeBundleOrder 加载顺序编排）、`lib/diag.js`（collectBootEvidence / classifyFailure / suggestAction 规则式归因）、`lib/selfheal.js`（闭环恢复执行器：动作→dump-config 校验→失败回滚→记 incident）、`lib/depsafe.js`（依赖感知禁用防护：reverseDeps / activeBaseline / guardDisable——自动禁用前校验反向依赖，防重演 09-03 gateway 连锁事故）
 - **串行测试脚本**（`scripts/run-tests.js`）：规避 Node 并发 test runner 的偶发 deserialize 问题
 
 ### 变更
 
 - `daemon` 命令已移除（dshpkg 不碰系统级注册，守护收敛为 bundle 内进程守护）
+- 接线规格（CLI 内存治理标志、宿主定时采样、install 后 bundles 重排）见 `OPTIMIZE-GOVERNOR.md`
+
+### 修复
+
+- incidents 事件流统一时间戳字段（writer 单写 `t`，去掉调用方冗余 `at`）
+- lock-busy 事件带 `lock` 字段标识锁类型（sync / supervisor），消除 audit/log 上无法区分锁源的噪音
 
 ## [0.1.0-rc.1] - 2026-08-27（预发布候选）
 
